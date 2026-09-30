@@ -10,11 +10,6 @@ from app.services.users import get_user_orders
 router = Router(name="menu")
 
 
-@router.message(F.text == texts.BTN_NEW_REPORT)
-async def new_report(message: Message) -> None:
-    await message.answer(texts.NEW_REPORT_STUB)
-
-
 @router.message(F.text == texts.BTN_MY_ORDERS)
 async def my_orders(message: Message, session: AsyncSession, user: User) -> None:
     orders = await get_user_orders(session, user.id)

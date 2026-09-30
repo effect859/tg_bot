@@ -1,5 +1,7 @@
 """Доменные ошибки заказа. Сообщения — для логов и разработчика, не для пользователя."""
 
+from enum import StrEnum
+
 from app.domain.enums import MaterialProcessingStatus, OrderStatus
 
 
@@ -89,8 +91,25 @@ class MaterialLimitError(OrderDomainError):
         self.limit = limit
 
 
+class MaterialRejectReason(StrEnum):
+    """Почему файл не принят: по причине бот выбирает понятное пользователю сообщение."""
+
+    FILENAME = "filename"
+    FORMAT = "format"
+    MIME = "mime"
+    EMPTY = "empty"
+    # Больше MAX_MATERIAL_SIZE_BYTES.
+    SIZE = "size"
+    # Содержимое не соответствует расширению (сигнатура, структура, кодировка).
+    CONTENT = "content"
+
+
 class UnsupportedMaterialError(OrderDomainError):
-    """Файл не принимается: формат, размер или метаданные не проходят проверку."""
+    """Файл не принимается: формат, размер, метаданные или содержимое не проходят проверку."""
+
+    def __init__(self, message: str, *, reason: MaterialRejectReason) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class MaterialNotFoundError(OrderDomainError):

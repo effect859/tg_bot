@@ -2,7 +2,11 @@ import pytest
 
 from app.domain.enums import MaterialProcessingStatus as M
 from app.domain.enums import OrderStatus
-from app.domain.errors import InvalidMaterialTransitionError, UnsupportedMaterialError
+from app.domain.errors import (
+    InvalidMaterialTransitionError,
+    MaterialRejectReason,
+    UnsupportedMaterialError,
+)
 from app.domain.materials import (
     MATERIAL_ACCEPTING_STATUSES,
     MATERIAL_TRANSITIONS,
@@ -111,3 +115,30 @@ def test_materials_accepted_after_consent_and_before_payment() -> None:
     assert OrderStatus.WAITING_FOR_MISSING_DATA in MATERIAL_ACCEPTING_STATUSES
     for status in (OrderStatus.PAID, OrderStatus.COMPLETED, OrderStatus.CANCELLED):
         assert status not in MATERIAL_ACCEPTING_STATUSES
+
+
+@pytest.mark.parametrize(
+    ("filename", "mime_type", "size_bytes", "reason"),
+    [
+        ("", None, 1024, MaterialRejectReason.FILENAME),
+        ("x" * 252 + ".pdf", None, 1024, MaterialRejectReason.FILENAME),
+        ("photo.png", "image/png", 1024, MaterialRejectReason.FORMAT),
+        ("no_extension", None, 1024, MaterialRejectReason.FORMAT),
+        ("fake.pdf", "image/jpeg", 1024, MaterialRejectReason.MIME),
+        ("empty.pdf", "application/pdf", 0, MaterialRejectReason.EMPTY),
+        ("huge.pdf", "application/pdf", MAX_MATERIAL_SIZE_BYTES + 1, MaterialRejectReason.SIZE),
+    ],
+)
+def test_rejection_reason(
+    filename: str, mime_type: str | None, size_bytes: int, reason: MaterialRejectReason
+) -> None:
+    with pytest.raises(UnsupportedMaterialError) as exc_info:
+        check_material(filename, mime_type, size_bytes)
+    assert exc_info.value.reason is reason
+
+
+def test_unknown_size_skips_size_check() -> None:
+    # До скачивания Telegram может не сообщить размер: проверяется всё остальное.
+    assert check_material("a.pdf", "application/pdf", None) == "pdf"
+    with pytest.raises(UnsupportedMaterialError):
+        check_material("a.png", None, None)

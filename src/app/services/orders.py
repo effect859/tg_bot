@@ -49,6 +49,14 @@ async def can_create_order(session: AsyncSession, user_id: int) -> bool:
     return await get_active_order(session, user_id) is None
 
 
+async def get_user_order(session: AsyncSession, user_id: int, order_id: int) -> Order:
+    """Заказ пользователя. Чужой и несуществующий заказ неразличимы: OrderNotFoundError."""
+    order = await session.get(Order, order_id, populate_existing=True)
+    if order is None or order.user_id != user_id:
+        raise OrderNotFoundError(order_id)
+    return order
+
+
 async def lock_order(session: AsyncSession, order_id: int) -> Order:
     """Блокирует строку заказа до конца транзакции: изменения заказа идут по очереди."""
     stmt = (
@@ -96,7 +104,11 @@ async def change_status(
             # Повтор шага: сбой больше не актуален.
             order.failed_from_status = None
             order.error = None
-        if order.status is OrderStatus.WAITING_FOR_CONSENT:
+        # Согласие — только переход к приёму файлов; отмена на этом шаге его не даёт.
+        if (
+            order.status is OrderStatus.WAITING_FOR_CONSENT
+            and target is OrderStatus.WAITING_FOR_FILES
+        ):
             order.consent_given_at = func.now()
         if target is OrderStatus.COMPLETED:
             order.completed_at = func.now()

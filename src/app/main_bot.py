@@ -10,6 +10,7 @@ from app.bot.setup import create_dispatcher
 from app.config import get_settings
 from app.db.session import create_engine, create_sessionmaker
 from app.logging_setup import setup_logging
+from app.services.storage.local import LocalFileStorage
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,9 @@ async def main() -> None:
         token=settings.bot_token.get_secret_value(),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dispatcher = create_dispatcher(create_sessionmaker(engine), storage)
+    dispatcher = create_dispatcher(
+        create_sessionmaker(engine), storage, LocalFileStorage(settings.storage_dir)
+    )
 
     logger.info("Bot is starting (polling)")
     try:

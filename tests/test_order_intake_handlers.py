@@ -1,0 +1,768 @@
+"""Хендлеры оформления заказа и приёма файлов.
+
+Message, CallbackQuery и Bot — моки: проверяется наша логика поверх aiogram,
+реальный Telegram Bot API не вызывается. БД — настоящая PostgreSQL-сессия,
+хранилище — LocalFileStorage во временном каталоге.
+"""
+
+import logging
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, BinaryIO
+from unittest.mock import AsyncMock
+
+import pytest
+from aiogram.exceptions import TelegramNetworkError
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.methods import GetFile
+from aiogram.types import Document, File, InlineKeyboardMarkup
+from aiogram.types import User as TgUser
+from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.bot import texts
+from app.bot.handlers import order_intake
+from app.bot.handlers.order_intake import (
+    cancel_order,
+    give_consent,
+    new_report,
+    receive_document,
+)
+from app.bot.keyboards import OrderAction, OrderCallback
+from app.bot.setup import create_dispatcher
+from app.db.models import Order, OrderMaterial, User
+from app.domain.enums import OrderStatus
+from app.domain.errors import (
+    ConsentNotGivenError,
+    MaterialLimitError,
+    MaterialRejectReason,
+    MaterialsLockedError,
+    MaterialsNotAcceptedError,
+    OrderNotFoundError,
+    UnsupportedMaterialError,
+)
+from app.domain.materials import MAX_MATERIAL_SIZE_BYTES, MAX_MATERIALS_PER_ORDER
+from app.services import order_materials as materials
+from app.services import orders
+from app.services.storage.local import LocalFileStorage
+from app.services.users import register_or_update_user
+from material_samples import DOCX_BYTES, DOCX_MIME, PDF_BYTES, PNG_BYTES, TXT_BYTES, make_zip
+
+S = OrderStatus
+REQUIREMENTS = {"topic": "Анализ бизнес-процессов"}
+BOT_TOKEN = "123456:SECRET-TOKEN"
+
+
+@pytest.fixture
+def storage_root(tmp_path: Path) -> Path:
+    return tmp_path / "storage"
+
+
+@pytest.fixture
+def file_storage(storage_root: Path) -> LocalFileStorage:
+    return LocalFileStorage(storage_root)
+
+
+async def _user(session: AsyncSession, tg_id: int = 1) -> User:
+    return await register_or_update_user(
+        session, tg_id=tg_id, username=None, first_name=None, language_code=None
+    )
+
+
+async def _order(session: AsyncSession, user: User, *, consent: bool = True) -> Order:
+    order = await orders.create_order(session, user_id=user.id)
+    order = await orders.change_status(session, order.id, S.WAITING_FOR_CONSENT)
+    if consent:
+        order = await orders.change_status(session, order.id, S.WAITING_FOR_FILES)
+    return order
+
+
+def _message(
+    filename: str | None = "task.pdf",
+    mime_type: str | None = "application/pdf",
+    file_size: int | None = 100,
+) -> AsyncMock:
+    message = AsyncMock()
+    message.document = Document(
+        file_id="file-id",
+        file_unique_id="file-uid",
+        file_name=filename,
+        mime_type=mime_type,
+        file_size=file_size,
+    )
+    return message
+
+
+def _bot(data: bytes | None = None, *, chunks: list[bytes] | None = None) -> AsyncMock:
+    """Bot, у которого get_file/download_file отдают ``data`` (или ``chunks``)."""
+    bot = AsyncMock()
+    bot.get_file.return_value = File(
+        file_id="file-id",
+        file_unique_id="file-uid",
+        file_size=None if data is None else len(data),
+        file_path="documents/file_1",
+    )
+    bot.download_file.side_effect = _streams(chunks if chunks is not None else [data or b""])
+    return bot
+
+
+def _streams(chunks: list[bytes], before: Callable[[], Any] | None = None) -> Callable[..., Any]:
+    async def download_file(file_path: str, destination: BinaryIO, **kwargs: object) -> BinaryIO:
+        if before is not None:
+            await before()
+        for chunk in chunks:
+            destination.write(chunk)
+        return destination
+
+    return download_file
+
+
+def _callback(tg_id: int = 1) -> AsyncMock:
+    callback = AsyncMock()
+    callback.message = None
+    callback.from_user = TgUser(id=tg_id, is_bot=False, first_name="U")
+    return callback
+
+
+def _reply(message: AsyncMock) -> str:
+    message.answer.assert_awaited_once()
+    return message.answer.await_args.args[0]
+
+
+async def _materials(session: AsyncSession, order_id: int) -> list[OrderMaterial]:
+    return await materials.get_order_materials(session, order_id)
+
+
+def _files(root: Path) -> list[str]:
+    if not root.exists():
+        return []
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
+
+
+async def _receive(
+    session: AsyncSession,
+    user: User,
+    bot: AsyncMock,
+    file_storage: LocalFileStorage,
+    message: AsyncMock,
+) -> str:
+    await receive_document(message, session, user, bot, file_storage)
+    return _reply(message)
+
+
+# --- Новый отчёт, согласие, отмена ---------------------------------------------------
+
+
+async def test_new_report_creates_order_waiting_for_consent(session: AsyncSession) -> None:
+    user = await _user(session)
+    message = AsyncMock()
+
+    await new_report(message, session, user)
+
+    order = await orders.get_active_order(session, user.id)
+    assert order is not None
+    assert order.status is S.WAITING_FOR_CONSENT
+    assert _reply(message) == texts.CONSENT_REQUEST
+    markup: InlineKeyboardMarkup = message.answer.await_args.kwargs["reply_markup"]
+    actions = [OrderCallback.unpack(b.callback_data) for row in markup.inline_keyboard for b in row]
+    assert actions == [
+        OrderCallback(action=OrderAction.CONSENT, order_id=order.id),
+        OrderCallback(action=OrderAction.CANCEL, order_id=order.id),
+    ]
+
+
+async def test_new_report_twice_does_not_create_second_order(session: AsyncSession) -> None:
+    user = await _user(session)
+    await new_report(AsyncMock(), session, user)
+    message = AsyncMock()
+
+    await new_report(message, session, user)
+
+    count = await session.scalar(select(func.count()).where(Order.user_id == user.id))
+    assert count == 1
+    assert _reply(message) == texts.CONSENT_REQUEST
+
+
+async def test_new_report_reminds_about_order_waiting_for_files(session: AsyncSession) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    message = AsyncMock()
+
+    await new_report(message, session, user)
+
+    assert f"Заказ #{order.id} ждёт материалы" in _reply(message)
+
+
+async def test_consent_moves_order_to_waiting_for_files(session: AsyncSession) -> None:
+    user = await _user(session)
+    order = await _order(session, user, consent=False)
+    callback, bot = _callback(), AsyncMock()
+
+    await give_consent(
+        callback,
+        OrderCallback(action=OrderAction.CONSENT, order_id=order.id),
+        session,
+        user,
+        bot,
+    )
+
+    await session.refresh(order)
+    assert order.status is S.WAITING_FOR_FILES
+    assert order.consent_given_at is not None
+    callback.answer.assert_awaited_once_with()
+    assert bot.send_message.await_args.args == (user.tg_id, texts.FILES_REQUEST)
+
+
+async def test_repeated_consent_is_rejected_without_change(session: AsyncSession) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    consent_at = order.consent_given_at
+    callback, bot = _callback(), AsyncMock()
+
+    await give_consent(
+        callback, OrderCallback(action=OrderAction.CONSENT, order_id=order.id), session, user, bot
+    )
+
+    await session.refresh(order)
+    assert order.status is S.WAITING_FOR_FILES
+    assert order.consent_given_at == consent_at
+    text = callback.answer.await_args.args[0]
+    assert text == texts.action_outdated(order)
+    bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.parametrize("action", [OrderAction.CONSENT, OrderAction.CANCEL])
+async def test_buttons_of_foreign_order_do_nothing(
+    session: AsyncSession, action: OrderAction
+) -> None:
+    owner = await _user(session, tg_id=1)
+    stranger = await _user(session, tg_id=2)
+    order = await _order(session, owner, consent=False)
+    callback, bot = _callback(tg_id=2), AsyncMock()
+    handler = give_consent if action is OrderAction.CONSENT else cancel_order
+
+    await handler(callback, OrderCallback(action=action, order_id=order.id), session, stranger, bot)
+
+    await session.refresh(order)
+    assert order.status is S.WAITING_FOR_CONSENT
+    callback.answer.assert_awaited_once_with(texts.ORDER_NOT_FOUND, show_alert=True)
+    bot.send_message.assert_not_awaited()
+
+
+async def test_cancel_order(session: AsyncSession) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    callback, bot = _callback(), AsyncMock()
+
+    await cancel_order(
+        callback, OrderCallback(action=OrderAction.CANCEL, order_id=order.id), session, user, bot
+    )
+
+    await session.refresh(order)
+    assert order.status is S.CANCELLED
+    assert order.cancelled_at is not None
+    assert bot.send_message.await_args.args == (user.tg_id, texts.order_cancelled(order))
+    # После отмены можно начать новый заказ.
+    assert await orders.get_active_order(session, user.id) is None
+
+
+async def test_repeated_cancel_is_rejected(session: AsyncSession) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    data = OrderCallback(action=OrderAction.CANCEL, order_id=order.id)
+    await cancel_order(_callback(), data, session, user, AsyncMock())
+    callback, bot = _callback(), AsyncMock()
+
+    await cancel_order(callback, data, session, user, bot)
+
+    await session.refresh(order)
+    assert order.status is S.CANCELLED
+    assert callback.answer.await_args.args[0] == texts.action_outdated(order)
+    bot.send_message.assert_not_awaited()
+
+
+async def test_consent_after_cancel_is_rejected(session: AsyncSession) -> None:
+    user = await _user(session)
+    order = await _order(session, user, consent=False)
+    cancel = OrderCallback(action=OrderAction.CANCEL, order_id=order.id)
+    await cancel_order(_callback(), cancel, session, user, AsyncMock())
+    callback = _callback()
+
+    await give_consent(
+        callback,
+        OrderCallback(action=OrderAction.CONSENT, order_id=order.id),
+        session,
+        user,
+        AsyncMock(),
+    )
+
+    await session.refresh(order)
+    assert order.status is S.CANCELLED
+    assert order.consent_given_at is None
+    assert "отменён" in callback.answer.await_args.args[0]
+
+
+# --- Приём документов: успех ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("filename", "mime_type", "data", "extension"),
+    [
+        ("Задание.pdf", "application/pdf", PDF_BYTES, "pdf"),
+        ("Методичка.docx", DOCX_MIME, DOCX_BYTES, "docx"),
+        ("notes.txt", "text/plain", TXT_BYTES, "txt"),
+        ("unknown_mime.pdf", None, PDF_BYTES, "pdf"),
+    ],
+)
+async def test_document_is_accepted(
+    session: AsyncSession,
+    file_storage: LocalFileStorage,
+    filename: str,
+    mime_type: str | None,
+    data: bytes,
+    extension: str,
+) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    message = _message(filename, mime_type, len(data))
+
+    reply = await _receive(session, user, _bot(data), file_storage, message)
+
+    assert reply == texts.material_accepted(filename, 1)
+    [material] = await _materials(session, order.id)
+    assert material.storage_key == f"orders/{order.id}/materials/1.{extension}"
+    assert await file_storage.read(material.storage_key) == data
+
+
+async def test_three_files_in_a_row(session: AsyncSession, file_storage: LocalFileStorage) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    replies = []
+    for name, mime, data in [
+        ("a.pdf", "application/pdf", PDF_BYTES),
+        ("b.docx", DOCX_MIME, DOCX_BYTES),
+        ("c.txt", "text/plain", TXT_BYTES),
+    ]:
+        replies.append(
+            await _receive(session, user, _bot(data), file_storage, _message(name, mime, len(data)))
+        )
+
+    assert replies == [
+        texts.material_accepted("a.pdf", 1),
+        texts.material_accepted("b.docx", 2),
+        texts.material_accepted("c.txt", 3),
+    ]
+    assert [m.upload_order for m in await _materials(session, order.id)] == [1, 2, 3]
+
+
+async def test_filename_is_html_escaped(
+    session: AsyncSession, file_storage: LocalFileStorage
+) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    name = '<b>x</b> & "y".pdf'
+
+    reply = await _receive(session, user, _bot(PDF_BYTES), file_storage, _message(name))
+
+    assert "&lt;b&gt;x&lt;/b&gt; &amp; &quot;y&quot;.pdf" in reply
+    assert "<b>x</b>" not in reply
+    [material] = await _materials(session, order.id)
+    # В БД хранится исходное имя, в путь хранения оно не попадает.
+    assert material.original_filename == name
+    assert "<" not in material.storage_key
+
+
+async def test_long_filename_is_shortened_in_reply(
+    session: AsyncSession, file_storage: LocalFileStorage
+) -> None:
+    user = await _user(session)
+    await _order(session, user)
+    name = "&" * 200 + ".pdf"
+
+    reply = await _receive(session, user, _bot(PDF_BYTES), file_storage, _message(name))
+
+    assert "&amp;" * (texts.FILENAME_PREVIEW_LENGTH - 1) + "…" in reply
+    # Не разрезали HTML-сущность.
+    assert "&amp…" not in reply and "&a…" not in reply
+
+
+# --- Приём документов: отказ без скачивания -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("filename", "mime_type", "file_size", "expected"),
+    [
+        ("photo.png", "image/png", 100, texts.MATERIAL_UNKNOWN_FORMAT),
+        ("archive.zip", "application/zip", 100, texts.MATERIAL_UNKNOWN_FORMAT),
+        (None, "application/pdf", 100, texts.MATERIAL_BAD_FILENAME),
+        ("fake.pdf", "image/jpeg", 100, texts.MATERIAL_MIME_MISMATCH),
+        ("big.pdf", "application/pdf", MAX_MATERIAL_SIZE_BYTES + 1, texts.MATERIAL_TOO_LARGE),
+        ("empty.pdf", "application/pdf", 0, texts.MATERIAL_EMPTY),
+    ],
+)
+async def test_rejected_before_download(
+    session: AsyncSession,
+    file_storage: LocalFileStorage,
+    storage_root: Path,
+    filename: str | None,
+    mime_type: str,
+    file_size: int,
+    expected: str,
+) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    bot = _bot(PDF_BYTES)
+
+    reply = await _receive(
+        session, user, bot, file_storage, _message(filename, mime_type, file_size)
+    )
+
+    assert reply == texts.material_failed(texts.file_label(filename), expected)
+    bot.get_file.assert_not_awaited()
+    bot.download_file.assert_not_awaited()
+    assert await _materials(session, order.id) == []
+    assert _files(storage_root) == []
+
+
+async def test_no_consent(session: AsyncSession, file_storage: LocalFileStorage) -> None:
+    user = await _user(session)
+    order = await _order(session, user, consent=False)
+    bot, message = _bot(PDF_BYTES), _message()
+
+    reply = await _receive(session, user, bot, file_storage, message)
+
+    assert reply == texts.material_failed("task.pdf", texts.MATERIAL_NO_CONSENT)
+    markup = message.answer.await_args.kwargs["reply_markup"]
+    assert OrderCallback.unpack(markup.inline_keyboard[0][0].callback_data) == OrderCallback(
+        action=OrderAction.CONSENT, order_id=order.id
+    )
+    bot.get_file.assert_not_awaited()
+    assert await _materials(session, order.id) == []
+
+
+async def test_requirements_confirmed(
+    session: AsyncSession, file_storage: LocalFileStorage
+) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    version = await orders.create_requirements_version(session, order.id, REQUIREMENTS)
+    await orders.confirm_requirements_version(session, order.id, version.id)
+    bot = _bot(PDF_BYTES)
+
+    reply = await _receive(session, user, bot, file_storage, _message())
+
+    assert reply == texts.material_failed("task.pdf", texts.MATERIAL_LOCKED)
+    bot.get_file.assert_not_awaited()
+
+
+async def test_material_limit(session: AsyncSession, file_storage: LocalFileStorage) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    for i in range(MAX_MATERIALS_PER_ORDER):
+        await materials.store_material(
+            session, file_storage, order.id, filename=f"{i}.pdf", mime_type=None, data=PDF_BYTES
+        )
+    bot = _bot(PDF_BYTES)
+
+    reply = await _receive(session, user, bot, file_storage, _message())
+
+    assert reply == texts.material_failed("task.pdf", texts.MATERIAL_LIMIT)
+    bot.get_file.assert_not_awaited()
+    assert len(await _materials(session, order.id)) == MAX_MATERIALS_PER_ORDER
+
+
+async def test_no_active_order(session: AsyncSession, file_storage: LocalFileStorage) -> None:
+    user = await _user(session)
+    bot = _bot(PDF_BYTES)
+
+    reply = await _receive(session, user, bot, file_storage, _message())
+
+    assert reply == texts.NO_ACTIVE_ORDER
+    bot.get_file.assert_not_awaited()
+
+
+async def test_document_never_goes_to_foreign_order(
+    session: AsyncSession, file_storage: LocalFileStorage, storage_root: Path
+) -> None:
+    owner = await _user(session, tg_id=1)
+    stranger = await _user(session, tg_id=2)
+    order = await _order(session, owner)
+    bot = _bot(PDF_BYTES)
+
+    reply = await _receive(session, stranger, bot, file_storage, _message())
+
+    assert reply == texts.NO_ACTIVE_ORDER
+    assert await _materials(session, order.id) == []
+    assert _files(storage_root) == []
+
+
+# --- Приём документов: отказ после скачивания -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("filename", "mime_type", "data"),
+    [
+        ("fake.pdf", "application/pdf", PNG_BYTES),
+        ("fake.docx", DOCX_MIME, PDF_BYTES),
+        # ZIP-сигнатура есть, обязательных частей DOCX нет.
+        ("zip.docx", DOCX_MIME, make_zip({"hello.txt": "hi"})),
+        ("binary.txt", "text/plain", PNG_BYTES),
+    ],
+)
+async def test_content_mismatch(
+    session: AsyncSession,
+    file_storage: LocalFileStorage,
+    storage_root: Path,
+    filename: str,
+    mime_type: str,
+    data: bytes,
+) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+
+    reply = await _receive(
+        session, user, _bot(data), file_storage, _message(filename, mime_type, len(data))
+    )
+
+    assert reply == texts.material_failed(filename, texts.MATERIAL_BAD_CONTENT)
+    assert await _materials(session, order.id) == []
+    assert _files(storage_root) == []
+
+
+@pytest.mark.parametrize("declared_size", [None, 100])
+async def test_actual_size_over_limit(
+    session: AsyncSession,
+    file_storage: LocalFileStorage,
+    storage_root: Path,
+    declared_size: int | None,
+) -> None:
+    # Telegram не сообщил размер или сообщил неверный: обрываем поток по байтам.
+    user = await _user(session)
+    order = await _order(session, user)
+    chunk = b"x" * (1024 * 1024)
+    bot = _bot(chunks=[PDF_BYTES] + [chunk] * 21)
+    bot.get_file.return_value = File(
+        file_id="file-id", file_unique_id="u", file_size=declared_size, file_path="p"
+    )
+
+    reply = await _receive(session, user, bot, file_storage, _message(file_size=declared_size))
+
+    assert reply == texts.material_failed("task.pdf", texts.MATERIAL_TOO_LARGE)
+    assert await _materials(session, order.id) == []
+    assert _files(storage_root) == []
+
+
+async def test_final_check_after_download_cancelled_order(
+    session: AsyncSession, file_storage: LocalFileStorage, storage_root: Path
+) -> None:
+    """Предварительная проверка прошла, но пока файл скачивался, заказ отменили."""
+    user = await _user(session)
+    order = await _order(session, user)
+    bot = _bot(PDF_BYTES)
+
+    async def cancel() -> None:
+        await orders.change_status(session, order.id, S.CANCELLED)
+
+    bot.download_file.side_effect = _streams([PDF_BYTES], before=cancel)
+
+    reply = await _receive(session, user, bot, file_storage, _message())
+
+    assert "сейчас файлы не принимаются" in reply
+    assert "отменён" in reply
+    assert await _materials(session, order.id) == []
+    assert _files(storage_root) == []
+
+
+async def test_final_check_after_download_limit_reached(
+    session: AsyncSession, file_storage: LocalFileStorage
+) -> None:
+    """Пока файл скачивался, параллельный файл занял последнее место."""
+    user = await _user(session)
+    order = await _order(session, user)
+    for i in range(MAX_MATERIALS_PER_ORDER - 1):
+        await materials.store_material(
+            session, file_storage, order.id, filename=f"{i}.pdf", mime_type=None, data=PDF_BYTES
+        )
+    bot = _bot(PDF_BYTES)
+
+    async def fill_last_slot() -> None:
+        await materials.store_material(
+            session, file_storage, order.id, filename="race.pdf", mime_type=None, data=PDF_BYTES
+        )
+
+    bot.download_file.side_effect = _streams([PDF_BYTES], before=fill_last_slot)
+
+    reply = await _receive(session, user, bot, file_storage, _message())
+
+    assert reply == texts.material_failed("task.pdf", texts.MATERIAL_LIMIT)
+    assert len(await _materials(session, order.id)) == MAX_MATERIALS_PER_ORDER
+
+
+# --- Технические сбои -----------------------------------------------------------------
+
+
+async def test_download_failure_keeps_previous_materials(
+    session: AsyncSession, file_storage: LocalFileStorage, caplog: pytest.LogCaptureFixture
+) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    await _receive(session, user, _bot(PDF_BYTES), file_storage, _message("first.pdf"))
+    bot = _bot(PDF_BYTES)
+    bot.get_file.side_effect = TelegramNetworkError(
+        method=GetFile(file_id="file-id"),
+        message=f"https://api.telegram.org/file/bot{BOT_TOKEN}/documents/file_1",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        reply = await _receive(session, user, bot, file_storage, _message("second.pdf"))
+
+    assert reply == texts.material_failed("second.pdf", texts.MATERIAL_DOWNLOAD_FAILED)
+    [material] = await _materials(session, order.id)
+    assert material.original_filename == "first.pdf"
+    assert await file_storage.read(material.storage_key) == PDF_BYTES
+    # Токен бота из текста исключения не попадает ни в лог, ни пользователю.
+    assert BOT_TOKEN not in caplog.text
+    assert BOT_TOKEN not in reply
+
+
+class _BrokenStorage(LocalFileStorage):
+    async def save(self, key: str, data: bytes) -> None:
+        raise OSError(f"[Errno 28] No space left on device: 'C:\\\\srv\\\\storage\\\\{key}'")
+
+
+async def test_storage_failure(
+    session: AsyncSession, file_storage: LocalFileStorage, storage_root: Path
+) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    await _receive(session, user, _bot(PDF_BYTES), file_storage, _message("first.pdf"))
+    broken = _BrokenStorage(storage_root)
+
+    reply = await _receive(session, user, _bot(PDF_BYTES), broken, _message("second.pdf"))
+
+    assert reply == texts.material_failed("second.pdf", texts.MATERIAL_STORAGE_FAILED)
+    assert "No space" not in reply and "srv" not in reply
+    assert [m.original_filename for m in await _materials(session, order.id)] == ["first.pdf"]
+    assert _files(storage_root) == [f"orders/{order.id}/materials/1.pdf"]
+
+
+async def test_database_failure(
+    session: AsyncSession,
+    file_storage: LocalFileStorage,
+    storage_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    order_id = order.id
+    await _receive(session, user, _bot(PDF_BYTES), file_storage, _message("first.pdf"))
+
+    async def broken_store(*args: object, **kwargs: object) -> None:
+        raise OperationalError("INSERT ...", {}, Exception("server closed the connection"))
+
+    monkeypatch.setattr(order_intake, "store_material", broken_store)
+
+    reply = await _receive(session, user, _bot(PDF_BYTES), file_storage, _message("second.pdf"))
+
+    assert reply == texts.material_failed("second.pdf", texts.MATERIAL_DB_FAILED)
+    assert "INSERT" not in reply and "server closed" not in reply
+    assert [m.original_filename for m in await _materials(session, order_id)] == ["first.pdf"]
+
+
+@pytest.mark.parametrize("committed", [True, False])
+async def test_commit_outcome_unknown_keeps_file(
+    session: AsyncSession,
+    file_storage: LocalFileStorage,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    committed: bool,
+) -> None:
+    """Финальный commit выбросил ошибку; на сервере он мог пройти или не пройти.
+
+    Моделируется подменой session.commit: для committed=True commit выполняется,
+    затем выбрасывается ошибка (обрыв соединения после фиксации).
+    """
+    user = await _user(session)
+    order = await _order(session, user)
+    order_id, user_id = order.id, user.id
+    real_commit = session.commit
+    calls = 0
+
+    async def flaky_commit() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:  # commit после предварительной проверки
+            await real_commit()
+            return
+        if committed:
+            await real_commit()
+        raise OperationalError("COMMIT", {}, Exception("connection lost"))
+
+    monkeypatch.setattr(session, "commit", flaky_commit)
+
+    with caplog.at_level(logging.ERROR):
+        reply = await _receive(session, user, _bot(PDF_BYTES), file_storage, _message())
+
+    storage_key = f"orders/{order_id}/materials/1.pdf"
+    assert reply == texts.material_failed("task.pdf", texts.MATERIAL_COMMIT_UNKNOWN)
+    assert "COMMIT" not in reply and "connection lost" not in reply
+    # Файл не удалён ни в одном из исходов.
+    assert await file_storage.read(storage_key) == PDF_BYTES
+    materials_now = await _materials(session, order_id)
+    assert len(materials_now) == (1 if committed else 0)
+    # В логе достаточно контекста для разбора.
+    [record] = [r for r in caplog.records if "commit outcome unknown" in r.getMessage()]
+    for value in (f"order_id={order_id}", f"user_id={user_id}", storage_key, "upload_order=1"):
+        assert value in record.getMessage()
+    assert record.exc_info is not None
+
+
+async def test_replies_have_no_internal_details(
+    session: AsyncSession, file_storage: LocalFileStorage, storage_root: Path
+) -> None:
+    user = await _user(session)
+    await _order(session, user)
+    replies = [
+        await _receive(session, user, _bot(PDF_BYTES), file_storage, _message()),
+        await _receive(session, user, _bot(PNG_BYTES), file_storage, _message("x.pdf")),
+    ]
+
+    for reply in replies:
+        assert "Traceback" not in reply
+        assert "orders/" not in reply
+        assert str(storage_root) not in reply
+
+
+# --- Тексты и подключение ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (UnsupportedMaterialError("x", reason=MaterialRejectReason.FORMAT), "формат"),
+        (UnsupportedMaterialError("x", reason=MaterialRejectReason.FILENAME), "имя"),
+        (UnsupportedMaterialError("x", reason=MaterialRejectReason.MIME), "тип файла"),
+        (UnsupportedMaterialError("x", reason=MaterialRejectReason.EMPTY), "пустой"),
+        (UnsupportedMaterialError("x", reason=MaterialRejectReason.SIZE), "большой"),
+        (UnsupportedMaterialError("x", reason=MaterialRejectReason.CONTENT), "содержимое"),
+        (MaterialLimitError(1, 20), "лимит"),
+        (ConsentNotGivenError(1), "согласие"),
+        (MaterialsLockedError(1), "подтверждены"),
+        (MaterialsNotAcceptedError(S.PAID), "оплачен"),
+        (OrderNotFoundError(1), "не принят"),
+    ],
+)
+def test_rejection_texts(error: Exception, expected: str) -> None:
+    text = texts.material_rejection(error)  # type: ignore[arg-type]
+    assert expected in text
+    assert str(error) not in text
+
+
+def test_dispatcher_provides_file_storage(
+    sessionmaker: async_sessionmaker[AsyncSession], file_storage: LocalFileStorage
+) -> None:
+    dispatcher = create_dispatcher(sessionmaker, MemoryStorage(), file_storage)
+
+    assert dispatcher["file_storage"] is file_storage
+    assert order_intake.router in dispatcher.sub_routers

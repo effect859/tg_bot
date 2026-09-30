@@ -65,3 +65,35 @@ async def test_db_middleware_rolls_back_on_error(
         await DbSessionMiddleware(sessionmaker)(handler, AsyncMock(), {})
 
     assert await session.scalar(select(User).where(User.tg_id == 888)) is None
+
+
+async def test_db_middleware_allows_commit_inside_handler(
+    sessionmaker: async_sessionmaker[AsyncSession], session: AsyncSession
+) -> None:
+    async def handler(event: Any, data: dict[str, Any]) -> None:
+        # Как приём файла: commit перед скачиванием, затем снова работа с БД.
+        data["session"].add(User(tg_id=901))
+        await data["session"].commit()
+        data["session"].add(User(tg_id=902))
+
+    await DbSessionMiddleware(sessionmaker)(handler, AsyncMock(), {})
+
+    tg_ids = set(await session.scalars(select(User.tg_id).where(User.tg_id.in_([901, 902]))))
+    assert tg_ids == {901, 902}
+
+
+async def test_db_middleware_rolls_back_only_uncommitted_work(
+    sessionmaker: async_sessionmaker[AsyncSession], session: AsyncSession
+) -> None:
+    async def handler(event: Any, data: dict[str, Any]) -> None:
+        data["session"].add(User(tg_id=903))
+        await data["session"].commit()
+        data["session"].add(User(tg_id=904))
+        await data["session"].flush()
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        await DbSessionMiddleware(sessionmaker)(handler, AsyncMock(), {})
+
+    tg_ids = set(await session.scalars(select(User.tg_id).where(User.tg_id.in_([903, 904]))))
+    assert tg_ids == {903}

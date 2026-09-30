@@ -200,6 +200,14 @@ async def test_revision_blocked_while_another_order_is_active(session: AsyncSess
 # --- E, F: переходы статусов ---------------------------------------------------------
 
 
+async def test_cancel_at_consent_step_does_not_record_consent(session: AsyncSession) -> None:
+    order = await _order(session)
+    order = await _advance(session, order, S.WAITING_FOR_CONSENT, S.CANCELLED)
+
+    assert order.consent_given_at is None
+    assert order.cancelled_at is not None
+
+
 async def test_full_flow_with_revision(session: AsyncSession) -> None:
     order = await _order(session)
     order = await _advance(session, order, S.WAITING_FOR_CONSENT, S.WAITING_FOR_FILES)

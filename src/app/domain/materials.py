@@ -3,13 +3,16 @@
 Модуль чистый (без БД и Telegram) и работает только с метаданными файла.
 check_material проверяет согласованность переданных метаданных (имя, заявленный
 MIME, размер), но не содержимое: клиент может прислать что угодно под именем
-``x.pdf``. Проверка фактического содержимого (сигнатура PDF, структура ZIP/DOCX,
-кодировка TXT) — ответственность этапа получения и обработки файла; при
-несовпадении материал переводится в FAILED.
+``x.pdf``. Минимальная проверка фактического содержимого — в
+app.domain.material_content, она выполняется при приёме файла, до создания материала.
 """
 
 from app.domain.enums import MaterialProcessingStatus, OrderStatus
-from app.domain.errors import InvalidMaterialTransitionError, UnsupportedMaterialError
+from app.domain.errors import (
+    InvalidMaterialTransitionError,
+    MaterialRejectReason,
+    UnsupportedMaterialError,
+)
 from app.domain.order_flow import PRE_PAYMENT_STATUSES
 
 M = MaterialProcessingStatus
@@ -43,33 +46,47 @@ MATERIAL_TRANSITIONS: dict[MaterialProcessingStatus, frozenset[MaterialProcessin
 }
 
 
-def check_material(filename: str, mime_type: str | None, size_bytes: int) -> str:
+def check_material(filename: str, mime_type: str | None, size_bytes: int | None) -> str:
     """Проверяет метаданные файла и возвращает нормализованное расширение (``"pdf"``).
+
+    ``size_bytes=None`` — размер ещё неизвестен (Telegram не сообщил его до скачивания):
+    проверка размера пропускается, её нужно повторить по фактическим байтам.
 
     Raises UnsupportedMaterialError.
     """
     name = filename.strip()
     if not name or len(name) > MAX_FILENAME_LENGTH:
-        raise UnsupportedMaterialError(f"Invalid filename length: {filename!r}")
+        raise UnsupportedMaterialError(
+            f"Invalid filename length: {filename!r}", reason=MaterialRejectReason.FILENAME
+        )
     stem, dot, extension = name.rpartition(".")
     extension = extension.lower()
     if not dot or not stem or extension not in SUPPORTED_MATERIAL_TYPES:
-        raise UnsupportedMaterialError(f"Unsupported file type: {filename!r}")
+        raise UnsupportedMaterialError(
+            f"Unsupported file type: {filename!r}", reason=MaterialRejectReason.FORMAT
+        )
 
     if mime_type is not None:
         # "text/plain; charset=utf-8" -> "text/plain"
         mime = mime_type.split(";", 1)[0].strip().lower()
         if mime not in UNKNOWN_MIME_TYPES and mime not in SUPPORTED_MATERIAL_TYPES[extension]:
             raise UnsupportedMaterialError(
-                f"MIME type {mime_type!r} does not match extension {extension!r}"
+                f"MIME type {mime_type!r} does not match extension {extension!r}",
+                reason=MaterialRejectReason.MIME,
             )
 
-    if not 0 < size_bytes <= MAX_MATERIAL_SIZE_BYTES:
-        raise UnsupportedMaterialError(f"File size {size_bytes} is out of range")
+    if size_bytes is not None and size_bytes <= 0:
+        raise UnsupportedMaterialError(
+            f"File size {size_bytes} is not positive", reason=MaterialRejectReason.EMPTY
+        )
+    if size_bytes is not None and size_bytes > MAX_MATERIAL_SIZE_BYTES:
+        raise UnsupportedMaterialError(
+            f"File size {size_bytes} exceeds the limit", reason=MaterialRejectReason.SIZE
+        )
     return extension
 
 
-def is_supported_material(filename: str, mime_type: str | None, size_bytes: int) -> bool:
+def is_supported_material(filename: str, mime_type: str | None, size_bytes: int | None) -> bool:
     try:
         check_material(filename, mime_type, size_bytes)
     except UnsupportedMaterialError:

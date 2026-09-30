@@ -4,6 +4,16 @@ from html import escape
 
 from app.db.models import Order
 from app.domain.enums import DocType, OrderStatus
+from app.domain.errors import (
+    ConsentNotGivenError,
+    MaterialLimitError,
+    MaterialRejectReason,
+    MaterialsLockedError,
+    MaterialsNotAcceptedError,
+    OrderDomainError,
+    UnsupportedMaterialError,
+)
+from app.domain.materials import MAX_MATERIAL_SIZE_BYTES, MAX_MATERIALS_PER_ORDER
 
 BTN_NEW_REPORT = "📝 Новый отчёт по практике"
 BTN_MY_ORDERS = "📂 Мои заказы"
@@ -33,9 +43,53 @@ ORDER_STATUS_LABELS: dict[OrderStatus, str] = {
     OrderStatus.CANCELLED: "отменён",
 }
 
-NEW_REPORT_STUB = (
-    "Создание отчёта по практике скоро будет доступно. "
-    "Мы сообщим, когда можно будет оформить первый заказ."
+BTN_CONSENT = "✅ Согласен"
+BTN_CANCEL_ORDER = "✖ Отменить заказ"
+
+MAX_MATERIAL_SIZE_MIB = MAX_MATERIAL_SIZE_BYTES // (1024 * 1024)
+# Сколько символов имени файла показываем в ответах.
+FILENAME_PREVIEW_LENGTH = 60
+
+# Черновик: юридическую формулировку согласия нужно утвердить отдельно.
+CONSENT_REQUEST = (
+    "<b>Новый отчёт по практике</b>\n\n"
+    "Чтобы подготовить отчёт, бот сохранит присланные вами файлы и данные заказа "
+    "и будет использовать их только для выполнения этого заказа.\n\n"
+    "Нажмите «Согласен», чтобы продолжить."
+)
+
+FILES_REQUEST = (
+    "Пришлите материалы для отчёта: задание на практику, "
+    "методические указания, примеры.\n\n"
+    "Форматы: PDF, DOCX или TXT — каждый файл отдельным документом, "
+    f"до {MAX_MATERIAL_SIZE_MIB} МиБ, не больше {MAX_MATERIALS_PER_ORDER} файлов."
+)
+
+NO_ACTIVE_ORDER = f"У вас нет активного заказа. Нажмите «{BTN_NEW_REPORT}», чтобы начать."
+ORDER_NOT_FOUND = "Заказ не найден."
+ORDER_CREATE_FAILED = "Не удалось создать заказ. Попробуйте ещё раз."
+
+MATERIAL_UNKNOWN_FORMAT = "формат не поддерживается. Пришлите PDF, DOCX или TXT."
+MATERIAL_BAD_FILENAME = "у файла некорректное имя. Переименуйте файл и пришлите его снова."
+MATERIAL_MIME_MISMATCH = (
+    "тип файла не совпадает с расширением. Проверьте файл и пришлите его снова."
+)
+MATERIAL_BAD_CONTENT = (
+    "содержимое файла не соответствует расширению или файл повреждён. "
+    "Проверьте файл и пришлите его снова."
+)
+MATERIAL_TOO_LARGE = f"файл слишком большой: максимум {MAX_MATERIAL_SIZE_MIB} МиБ."
+MATERIAL_EMPTY = "файл пустой."
+MATERIAL_LIMIT = f"достигнут лимит: не больше {MAX_MATERIALS_PER_ORDER} файлов на заказ."
+MATERIAL_NO_CONSENT = "сначала подтвердите согласие — нажмите «Согласен»."
+MATERIAL_LOCKED = "данные заказа уже подтверждены, новые файлы добавить нельзя."
+MATERIAL_REJECTED = "файл не принят."
+MATERIAL_DOWNLOAD_FAILED = "не удалось получить файл из Telegram. Отправьте его ещё раз."
+MATERIAL_STORAGE_FAILED = "не удалось сохранить файл. Попробуйте позже."
+MATERIAL_DB_FAILED = "техническая ошибка, файл не принят. Попробуйте позже."
+MATERIAL_COMMIT_UNKNOWN = (
+    "техническая ошибка при сохранении: не удалось подтвердить, что файл принят. "
+    "Отправьте его ещё раз."
 )
 
 NO_ORDERS = "У вас пока нет заказов."
@@ -76,3 +130,72 @@ def orders_list(orders: list[Order]) -> str:
         status = ORDER_STATUS_LABELS.get(order.status, order.status)
         lines.append(f"#{order.id} · {doc} · {status} · {created}")
     return "\n".join(lines)
+
+
+def status_label(status: OrderStatus) -> str:
+    return ORDER_STATUS_LABELS.get(status, status)
+
+
+def active_order_exists(order: Order) -> str:
+    return (
+        f"У вас уже есть активный заказ #{order.id} ({status_label(order.status)}). "
+        "Новый можно оформить после его завершения или отмены."
+    )
+
+
+def waiting_for_files(order: Order) -> str:
+    return f"Заказ #{order.id} ждёт материалы.\n\n{FILES_REQUEST}"
+
+
+def order_cancelled(order: Order) -> str:
+    return f"Заказ #{order.id} отменён."
+
+
+def action_outdated(order: Order) -> str:
+    return f"Действие уже неактуально: заказ #{order.id} — «{status_label(order.status)}»."
+
+
+def file_label(filename: str | None) -> str:
+    """Имя файла для ответа: укороченное и экранированное для HTML."""
+    name = (filename or "").strip()
+    if not name:
+        return "без имени"
+    if len(name) > FILENAME_PREVIEW_LENGTH:
+        name = name[: FILENAME_PREVIEW_LENGTH - 1] + "…"
+    # Обрезаем до экранирования, чтобы не разрезать HTML-сущность.
+    return escape(name)
+
+
+def material_accepted(label: str, count: int) -> str:
+    return f"✅ Файл «{label}» принят ({count} из {MAX_MATERIALS_PER_ORDER})."
+
+
+def material_failed(label: str, reason: str) -> str:
+    return f"❌ Файл «{label}»: {reason}"
+
+
+def material_rejection(error: OrderDomainError) -> str:
+    """Причина отказа в приёме файла — без технических подробностей."""
+    match error:
+        case UnsupportedMaterialError(reason=MaterialRejectReason.FORMAT):
+            return MATERIAL_UNKNOWN_FORMAT
+        case UnsupportedMaterialError(reason=MaterialRejectReason.FILENAME):
+            return MATERIAL_BAD_FILENAME
+        case UnsupportedMaterialError(reason=MaterialRejectReason.MIME):
+            return MATERIAL_MIME_MISMATCH
+        case UnsupportedMaterialError(reason=MaterialRejectReason.CONTENT):
+            return MATERIAL_BAD_CONTENT
+        case UnsupportedMaterialError(reason=MaterialRejectReason.EMPTY):
+            return MATERIAL_EMPTY
+        case UnsupportedMaterialError(reason=MaterialRejectReason.SIZE):
+            return MATERIAL_TOO_LARGE
+        case MaterialLimitError():
+            return MATERIAL_LIMIT
+        case ConsentNotGivenError():
+            return MATERIAL_NO_CONSENT
+        case MaterialsLockedError():
+            return MATERIAL_LOCKED
+        case MaterialsNotAcceptedError(status=status):
+            return f"сейчас файлы не принимаются: заказ на шаге «{status_label(status)}»."
+        case _:
+            return MATERIAL_REJECTED
