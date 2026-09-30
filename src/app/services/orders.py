@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -49,6 +49,20 @@ async def can_create_order(session: AsyncSession, user_id: int) -> bool:
     return await get_active_order(session, user_id) is None
 
 
+async def lock_order(session: AsyncSession, order_id: int) -> Order:
+    """Блокирует строку заказа до конца транзакции: изменения заказа идут по очереди."""
+    stmt = (
+        select(Order)
+        .where(Order.id == order_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    order = await session.scalar(stmt)
+    if order is None:
+        raise OrderNotFoundError(order_id)
+    return order
+
+
 async def create_order(
     session: AsyncSession, *, user_id: int, doc_type: DocType = DocType.PRACTICE_REPORT
 ) -> Order:
@@ -66,7 +80,7 @@ async def change_status(
     session: AsyncSession, order_id: int, target: OrderStatus, *, error: str | None = None
 ) -> Order:
     """Переводит заказ в target, проверяя карту переходов и доменные условия."""
-    order = await _lock_order(session, order_id)
+    order = await lock_order(session, order_id)
     check_transition(order.status, target, order.failed_from_status)
 
     if target is OrderStatus.PREPARING_PLAN:
@@ -94,6 +108,17 @@ async def change_status(
 
 
 # --- Версии ТЗ -----------------------------------------------------------------------
+
+
+async def has_confirmed_requirements(session: AsyncSession, order_id: int) -> bool:
+    """Есть ли у заказа хотя бы одна подтверждённая версия ТЗ (любая, не только последняя)."""
+    stmt = select(
+        exists().where(
+            OrderRequirementsVersion.order_id == order_id,
+            OrderRequirementsVersion.status == VersionStatus.CONFIRMED,
+        )
+    )
+    return bool(await session.scalar(stmt))
 
 
 async def get_requirements_versions(
@@ -221,22 +246,9 @@ async def _guard_active_order(user_id: int) -> AsyncIterator[None]:
         raise
 
 
-async def _lock_order(session: AsyncSession, order_id: int) -> Order:
-    stmt = (
-        select(Order)
-        .where(Order.id == order_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    order = await session.scalar(stmt)
-    if order is None:
-        raise OrderNotFoundError(order_id)
-    return order
-
-
 async def _lock_editable_order(session: AsyncSession, order_id: int) -> Order:
     """ТЗ и план меняются только до оплаты: оплачивается конкретный план."""
-    order = await _lock_order(session, order_id)
+    order = await lock_order(session, order_id)
     if order.status not in PRE_PAYMENT_STATUSES:
         raise OrderNotEditableError(order.status)
     return order

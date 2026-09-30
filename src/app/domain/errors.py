@@ -1,6 +1,6 @@
 """Доменные ошибки заказа. Сообщения — для логов и разработчика, не для пользователя."""
 
-from app.domain.enums import OrderStatus
+from app.domain.enums import MaterialProcessingStatus, OrderStatus
 
 
 class OrderDomainError(Exception):
@@ -56,3 +56,51 @@ class VersionAlreadyConfirmedError(OrderDomainError):
 
 class OutdatedVersionError(OrderDomainError):
     """Версия устарела: после неё уже создана более новая."""
+
+
+class ConsentNotGivenError(OrderDomainError):
+    """Материалы принимаются только после согласия пользователя."""
+
+    def __init__(self, order_id: int) -> None:
+        super().__init__(f"Order {order_id}: consent has not been given")
+        self.order_id = order_id
+
+
+class MaterialsNotAcceptedError(OrderDomainError):
+    """Заказ в статусе, в котором материалы не принимаются."""
+
+    def __init__(self, status: OrderStatus) -> None:
+        super().__init__(f"Materials cannot be added in status {status}")
+        self.status = status
+
+
+class MaterialsLockedError(OrderDomainError):
+    """ТЗ подтверждено: набор материалов зафиксирован."""
+
+    def __init__(self, order_id: int) -> None:
+        super().__init__(f"Order {order_id}: requirements confirmed, materials are locked")
+        self.order_id = order_id
+
+
+class MaterialLimitError(OrderDomainError):
+    def __init__(self, order_id: int, limit: int) -> None:
+        super().__init__(f"Order {order_id}: material limit of {limit} reached")
+        self.order_id = order_id
+        self.limit = limit
+
+
+class UnsupportedMaterialError(OrderDomainError):
+    """Файл не принимается: формат, размер или метаданные не проходят проверку."""
+
+
+class MaterialNotFoundError(OrderDomainError):
+    def __init__(self, material_id: int) -> None:
+        super().__init__(f"Material {material_id} not found")
+        self.material_id = material_id
+
+
+class InvalidMaterialTransitionError(OrderDomainError):
+    def __init__(self, current: MaterialProcessingStatus, target: MaterialProcessingStatus) -> None:
+        super().__init__(f"Material transition {current} -> {target} is not allowed")
+        self.current = current
+        self.target = target

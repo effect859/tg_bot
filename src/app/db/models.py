@@ -28,6 +28,7 @@ from app.domain.enums import (
     DocType,
     FileKind,
     LLMCallStatus,
+    MaterialProcessingStatus,
     OrderStatus,
     PaymentProvider,
     PaymentStatus,
@@ -167,7 +168,47 @@ class OrderPlanVersion(_OrderVersionMixin, Base):
     )
 
 
+class OrderMaterial(TimestampMixin, Base):
+    """Материал заказа, присланный пользователем (задание, методичка, пример отчёта).
+
+    Метаданные (имя, размер, ключ) после создания не меняются; меняется только
+    статус обработки. Материалы не удаляются: проблемный файл заменяется новым.
+    """
+
+    __tablename__ = "order_materials"
+    __table_args__ = (
+        # Порядок загрузки внутри заказа; индекс обслуживает выборку материалов заказа.
+        UniqueConstraint("order_id", "upload_order"),
+        CheckConstraint("upload_order >= 1", name="upload_order_positive"),
+        CheckConstraint("size_bytes > 0", name="size_positive"),
+        CheckConstraint(
+            "(processing_status = 'failed') = (processing_error IS NOT NULL)",
+            name="processing_error_consistent",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"))
+    upload_order: Mapped[int] = mapped_column(Integer)
+    original_filename: Mapped[str] = mapped_column(String(255))
+    # Нормализованное расширение без точки: "pdf", "docx", "txt".
+    extension: Mapped[str] = mapped_column(String(16))
+    # MIME, заявленный клиентом; содержимым файла не подтверждён.
+    mime_type: Mapped[str | None] = mapped_column(String(255))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    # Логический ключ будущего объекта в FileStorage. Наличие ключа не означает,
+    # что файл физически сохранён: сохранение — следующий этап.
+    storage_key: Mapped[str] = mapped_column(String(512))
+    processing_status: Mapped[MaterialProcessingStatus] = mapped_column(
+        _pg_enum(MaterialProcessingStatus, "material_processing_status"),
+        default=MaterialProcessingStatus.RECEIVED,
+    )
+    processing_error: Mapped[str | None] = mapped_column(Text)
+
+
 class OrderFile(Base):
+    """Пока не используется в коде."""
+
     __tablename__ = "order_files"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)

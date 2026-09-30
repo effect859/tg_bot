@@ -39,6 +39,15 @@ class VersionStatus(StrEnum):
     CONFIRMED = "confirmed"
 
 
+class MaterialProcessingStatus(StrEnum):
+    """Статус обработки материала заказа. Переходы — в app.domain.materials."""
+
+    RECEIVED = "received"
+    PROCESSING = "processing"
+    PROCESSED = "processed"
+    FAILED = "failed"
+
+
 class FileKind(StrEnum):
     INPUT = "input"
     OUTPUT = "output"
