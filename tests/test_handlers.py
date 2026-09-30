@@ -66,4 +66,4 @@ async def test_my_orders_lists_orders(session: AsyncSession) -> None:
     text = message.answer.await_args.args[0]
     assert f"#{order.id}" in text
     assert "Отчёт по практике" in text
-    assert "черновик" in text
+    assert "новый" in text

@@ -12,17 +12,31 @@ class DocType(StrEnum):
 
 
 class OrderStatus(StrEnum):
-    DRAFT = "draft"
-    COLLECTING = "collecting"
-    OUTLINE_READY = "outline_ready"
-    AWAITING_PAYMENT = "awaiting_payment"
+    """Статусы заказа. Допустимые переходы — в app.domain.order_flow."""
+
+    NEW = "new"
+    WAITING_FOR_CONSENT = "waiting_for_consent"
+    WAITING_FOR_FILES = "waiting_for_files"
+    ANALYZING_MATERIALS = "analyzing_materials"
+    WAITING_FOR_MISSING_DATA = "waiting_for_missing_data"
+    WAITING_FOR_DATA_CONFIRMATION = "waiting_for_data_confirmation"
+    PREPARING_PLAN = "preparing_plan"
+    WAITING_FOR_PLAN_CONFIRMATION = "waiting_for_plan_confirmation"
+    PAYMENT_PENDING = "payment_pending"
     PAID = "paid"
-    QUEUED = "queued"
     GENERATING = "generating"
-    RENDERING = "rendering"
-    DONE = "done"
+    COMPLETED = "completed"
+    REVISION_REQUESTED = "revision_requested"
+    REGENERATING = "regenerating"
     FAILED = "failed"
-    REFUNDED = "refunded"
+    CANCELLED = "cancelled"
+
+
+class VersionStatus(StrEnum):
+    """Статус версии ТЗ или плана: черновик редактируется, подтверждённая неизменна."""
+
+    DRAFT = "draft"
+    CONFIRMED = "confirmed"
 
 
 class FileKind(StrEnum):

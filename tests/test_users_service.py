@@ -2,7 +2,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Order, User
-from app.domain.enums import DocType
+from app.domain.enums import DocType, OrderStatus
 from app.services.users import get_user_orders, register_or_update_user
 
 
@@ -40,7 +40,12 @@ async def test_updates_existing_user_without_duplicate(session: AsyncSession) ->
 async def test_get_user_orders_returns_own_orders_newest_first(session: AsyncSession) -> None:
     user = await _register(session, tg_id=1)
     other = await _register(session, tg_id=2)
-    orders = [Order(user_id=user.id, doc_type=DocType.PRACTICE_REPORT) for _ in range(3)]
+    # Активным может быть только один заказ пользователя, остальные — завершённые.
+    statuses = [OrderStatus.CANCELLED, OrderStatus.COMPLETED, OrderStatus.NEW]
+    orders = [
+        Order(user_id=user.id, doc_type=DocType.PRACTICE_REPORT, status=status)
+        for status in statuses
+    ]
     session.add_all([*orders, Order(user_id=other.id, doc_type=DocType.PRACTICE_REPORT)])
     await session.flush()
 

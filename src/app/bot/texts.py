@@ -15,17 +15,22 @@ DOC_TYPE_LABELS: dict[DocType, str] = {
 }
 
 ORDER_STATUS_LABELS: dict[OrderStatus, str] = {
-    OrderStatus.DRAFT: "черновик",
-    OrderStatus.COLLECTING: "сбор данных",
-    OrderStatus.OUTLINE_READY: "план готов",
-    OrderStatus.AWAITING_PAYMENT: "ожидает оплаты",
+    OrderStatus.NEW: "новый",
+    OrderStatus.WAITING_FOR_CONSENT: "ожидает согласия",
+    OrderStatus.WAITING_FOR_FILES: "ожидает материалы",
+    OrderStatus.ANALYZING_MATERIALS: "анализ материалов",
+    OrderStatus.WAITING_FOR_MISSING_DATA: "нужны данные",
+    OrderStatus.WAITING_FOR_DATA_CONFIRMATION: "подтверждение данных",
+    OrderStatus.PREPARING_PLAN: "составляется план",
+    OrderStatus.WAITING_FOR_PLAN_CONFIRMATION: "подтверждение плана",
+    OrderStatus.PAYMENT_PENDING: "ожидает оплаты",
     OrderStatus.PAID: "оплачен",
-    OrderStatus.QUEUED: "в очереди",
     OrderStatus.GENERATING: "генерируется",
-    OrderStatus.RENDERING: "оформляется",
-    OrderStatus.DONE: "готов",
+    OrderStatus.COMPLETED: "готов",
+    OrderStatus.REVISION_REQUESTED: "запрошена доработка",
+    OrderStatus.REGENERATING: "дорабатывается",
     OrderStatus.FAILED: "ошибка",
-    OrderStatus.REFUNDED: "возврат",
+    OrderStatus.CANCELLED: "отменён",
 }
 
 NEW_REPORT_STUB = (

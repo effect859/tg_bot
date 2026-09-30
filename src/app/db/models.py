@@ -32,7 +32,9 @@ from app.domain.enums import (
     PaymentProvider,
     PaymentStatus,
     TransactionReason,
+    VersionStatus,
 )
+from app.domain.order_flow import INACTIVE_ORDER_STATUSES
 
 
 def _pg_enum(enum_cls: type[StrEnum], name: str) -> Enum:
@@ -67,27 +69,102 @@ class User(TimestampMixin, Base):
     )
 
 
+def _active_order_predicate() -> str:
+    inactive = ", ".join(f"'{status.value}'" for status in sorted(INACTIVE_ORDER_STATUSES))
+    return f"status NOT IN ({inactive})"
+
+
 class Order(TimestampMixin, Base):
     __tablename__ = "orders"
-    __table_args__ = (Index("ix_orders_user_id_created_at", "user_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_orders_user_id_created_at", "user_id", "created_at"),
+        # Не больше одного активного заказа на пользователя — гарантия на уровне БД.
+        Index(
+            "uq_orders_user_id_active",
+            "user_id",
+            unique=True,
+            postgresql_where=text(_active_order_predicate()),
+        ),
+        CheckConstraint(
+            "(status = 'failed') = (failed_from_status IS NOT NULL)",
+            name="failed_from_status_consistent",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    # Тип заказа: определяет схему ТЗ и пайплайн генерации.
     doc_type: Mapped[DocType] = mapped_column(_pg_enum(DocType, "doc_type"))
     status: Mapped[OrderStatus] = mapped_column(
-        _pg_enum(OrderStatus, "order_status"), default=OrderStatus.DRAFT, index=True
+        _pg_enum(OrderStatus, "order_status"), default=OrderStatus.NEW, index=True
     )
-    topic: Mapped[str | None] = mapped_column(Text)
-    # Параметры заказа: вуз, дисциплина, объём, место практики, доп. требования.
-    params: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, default=dict, server_default=text("'{}'::jsonb")
+    # Шаг, на котором произошёл сбой: повтор из FAILED возможен только в него.
+    failed_from_status: Mapped[OrderStatus | None] = mapped_column(
+        _pg_enum(OrderStatus, "order_status")
     )
-    outline: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     price: Mapped[int | None] = mapped_column(Integer)
     # Прогресс шагов пайплайна — для возобновления генерации после сбоя.
     pipeline_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     error: Mapped[str | None] = mapped_column(Text)
+    consent_given_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class _OrderVersionMixin(TimestampMixin):
+    """Общие поля версии ТЗ/плана.
+
+    Черновик (draft) редактируется, подтверждённая (confirmed) версия неизменна:
+    триггер БД запрещает UPDATE и DELETE подтверждённых строк (миграция 0002).
+    Изменения после подтверждения — только новой версией с номером на 1 больше.
+    """
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"))
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[VersionStatus] = mapped_column(
+        _pg_enum(VersionStatus, "version_status"), default=VersionStatus.DRAFT
+    )
+    content: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+def _version_table_args(table: str) -> tuple[Any, ...]:
+    return (
+        UniqueConstraint("order_id", "version"),
+        CheckConstraint("version >= 1", name="version_positive"),
+        CheckConstraint(
+            "(status = 'confirmed') = (confirmed_at IS NOT NULL)",
+            name="confirmed_at_consistent",
+        ),
+        # Не больше одного черновика на заказ.
+        Index(
+            f"uq_{table}_order_id_draft",
+            "order_id",
+            unique=True,
+            postgresql_where=text("status = 'draft'"),
+        ),
+    )
+
+
+class OrderRequirementsVersion(_OrderVersionMixin, Base):
+    """Версия ТЗ заказа. content валидируется схемой из REQUIREMENTS_SCHEMAS."""
+
+    __tablename__ = "order_requirements_versions"
+    __table_args__ = _version_table_args(__tablename__)
+
+
+class OrderPlanVersion(_OrderVersionMixin, Base):
+    """Версия плана заказа. content валидируется схемой PlanContent."""
+
+    __tablename__ = "order_plan_versions"
+    __table_args__ = _version_table_args(__tablename__)
+
+    # Версия ТЗ, на основе которой построен план.
+    requirements_version_id: Mapped[int] = mapped_column(
+        # Имя по соглашению длиннее лимита PostgreSQL в 63 символа.
+        ForeignKey("order_requirements_versions.id", name="fk_order_plan_versions_requirements")
+    )
 
 
 class OrderFile(Base):
