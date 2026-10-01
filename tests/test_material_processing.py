@@ -345,6 +345,138 @@ async def test_database_error_after_extraction_leaves_file_and_recoverable_state
     assert await storage.read(material.storage_key) == TXT_BYTES
 
 
+# --- Ошибки БД при сохранении результата ----------------------------------------------------
+
+
+def _raise_sql(code: str) -> str:
+    return f"DO $$ BEGIN RAISE EXCEPTION 'injected' USING ERRCODE = '{code}'; END $$"
+
+
+def _fail_first_flush(monkeypatch: pytest.MonkeyPatch, session: AsyncSession, code: str) -> None:
+    """Первый flush сессии (сохранение результата) падает настоящей ошибкой PostgreSQL."""
+    original = session.flush
+    calls = 0
+
+    async def flush(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await session.execute(text(_raise_sql(code)))
+        await original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session, "flush", flush)
+
+
+@pytest.mark.parametrize("code", ["40P01", "08006", "57014", "P0001"])
+async def test_temporary_database_error_on_save_is_retryable(
+    session: AsyncSession, storage: LocalFileStorage, monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    order_id = await _order(session)
+    material = await _store(session, storage, order_id)
+    _fail_first_flush(monkeypatch, session, code)
+
+    outcome = await process_material(session, storage, FakeExtractor(), material.id)
+
+    assert (outcome.kind, outcome.failure_reason, outcome.will_retry) == (
+        OutcomeKind.FAILED,
+        R.DATABASE_ERROR,
+        True,
+    )
+    material = await _fresh(session, material.id)
+    assert material.processing_status is M.FAILED
+    assert material.failure_reason is R.DATABASE_ERROR
+    assert material.processing_attempts == 1
+    assert f"sqlstate={code}" in (material.processing_error or "")
+    assert await _text_count(session) == 0
+
+    # Повтор: следующая обработка заказа берёт материал и сохраняет результат.
+    [retry] = await process_pending_materials(session, storage, FakeExtractor(), order_id)
+    assert retry.kind is OutcomeKind.PROCESSED
+    assert (await _fresh(session, material.id)).processing_attempts == 2
+
+
+async def test_rejected_result_is_terminal_and_keeps_cause(
+    session: AsyncSession, storage: LocalFileStorage
+) -> None:
+    """Настоящий отказ БД: pages_processed > page_count нарушает CHECK (23514)."""
+    order_id = await _order(session)
+    material = await _store(session, storage, order_id)
+    secret = "Текст документа, которого не должно быть в processing_error"
+    bad = ExtractionResult(text=secret, extractor="fake", page_count=1, pages_processed=2)
+
+    outcome = await process_material(session, storage, FakeExtractor(bad), material.id)
+
+    assert (outcome.kind, outcome.failure_reason, outcome.will_retry) == (
+        OutcomeKind.FAILED,
+        R.RESULT_REJECTED,
+        False,
+    )
+    material = await _fresh(session, material.id)
+    assert material.failure_reason is R.RESULT_REJECTED
+    error = material.processing_error or ""
+    assert error.startswith("permanent database error: sqlstate=23514 IntegrityError")
+    assert "ck_order_material_texts_pages_processed_range" in error
+    assert secret not in error
+    assert await _text_count(session) == 0
+    # Окончательный отказ не повторяется.
+    assert await process_pending_materials(session, storage, FakeExtractor(), order_id) == []
+
+
+async def test_failure_to_record_save_error_leaves_processing(
+    session: AsyncSession, storage: LocalFileStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.exc import DBAPIError
+
+    from app.services import material_processing
+
+    order_id = await _order(session)
+    material = await _store(session, storage, order_id)
+    _fail_first_flush(monkeypatch, session, "40P01")
+    original_lock = material_processing.lock_material
+    calls = 0
+
+    async def lock_material(session_: AsyncSession, material_id: int) -> OrderMaterial:
+        nonlocal calls
+        calls += 1
+        if calls == 3:  # захват, сохранение, запись сбоя
+            await session_.execute(text(_raise_sql("08006")))
+        return await original_lock(session_, material_id)
+
+    monkeypatch.setattr(material_processing, "lock_material", lock_material)
+    # После rollback объекты сессии устаревают: id и ключ запоминаем заранее.
+    material_id, storage_key = material.id, material.storage_key
+
+    with pytest.raises(DBAPIError) as caught:
+        await process_material(session, storage, FakeExtractor(), material_id)
+
+    # Наверх уходит исходная ошибка сохранения, а не ошибка записи сбоя.
+    assert caught.value.orig.sqlstate == "40P01"  # type: ignore[union-attr]
+    material = await _fresh(session, material_id)
+    assert material.processing_status is M.PROCESSING
+    assert material.processing_attempts == 1
+    assert await storage.read(storage_key) == TXT_BYTES
+
+
+async def test_material_deleted_during_extraction(
+    session: AsyncSession, storage: LocalFileStorage
+) -> None:
+    order_id = await _order(session)
+    material = await _store(session, storage, order_id)
+    extractor = FakeExtractor()
+
+    async def delete_order() -> None:
+        await session.execute(text("DELETE FROM orders WHERE id = :id"), {"id": order_id})
+        await session.commit()
+
+    extractor.on_extract = delete_order
+
+    outcome = await process_material(session, storage, extractor, material.id)
+
+    assert outcome.kind is OutcomeKind.DISCARDED
+    assert outcome.order_active is False
+    assert await _text_count(session) == 0
+
+
 # --- Прерванная обработка -------------------------------------------------------------------
 
 

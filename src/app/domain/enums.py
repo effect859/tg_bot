@@ -77,6 +77,10 @@ class MaterialFailureReason(StrEnum):
     EXTRACTOR_UNAVAILABLE = "extractor_unavailable"
     # Обработка зависла в PROCESSING (например, бот перезапустился посреди работы).
     INTERRUPTED = "interrupted"
+    # Результат не удалось сохранить из-за временной или нераспознанной ошибки БД.
+    DATABASE_ERROR = "database_error"
+    # БД детерминированно отвергла результат (ограничения, некорректные данные, лимиты).
+    RESULT_REJECTED = "result_rejected"
 
 
 class TextTruncationReason(StrEnum):

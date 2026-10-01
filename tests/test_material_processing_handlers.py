@@ -36,6 +36,7 @@ from app.extraction.runner import SubprocessTextExtractor
 from app.services import material_processing, orders
 from app.services import order_materials as materials
 from app.services.material_processing import OutcomeKind, ProcessingOutcome
+from app.services.material_recovery import MaterialRecovery
 from app.services.storage.local import LocalFileStorage
 from app.services.users import register_or_update_user
 from fake_extractor import FakeExtractor
@@ -268,6 +269,50 @@ def test_dispatcher_provides_text_extractor(
     assert dispatcher["text_extractor"] is extractor
 
 
+def _detach_routers(monkeypatch: pytest.MonkeyPatch) -> None:
+    for router in (start.router, menu.router, order_intake.router):
+        monkeypatch.setattr(router, "_parent_router", None)
+
+
+async def test_recovery_starts_and_stops_with_dispatcher(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    file_storage: LocalFileStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _detach_routers(monkeypatch)
+    started: list[MaterialRecovery] = []
+    original_start = MaterialRecovery.start
+
+    def remember_start(self: MaterialRecovery) -> None:
+        started.append(self)
+        original_start(self)
+
+    monkeypatch.setattr(MaterialRecovery, "start", remember_start)
+    dispatcher = create_dispatcher(sessionmaker, MemoryStorage(), file_storage, FakeExtractor())
+
+    await dispatcher.emit_startup(bot=AsyncMock())
+    [recovery] = started
+    assert recovery.running
+    await dispatcher.emit_shutdown(bot=AsyncMock())
+
+    assert not recovery.running
+
+
+async def test_no_recovery_without_extractor(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    file_storage: LocalFileStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _detach_routers(monkeypatch)
+    without = create_dispatcher(sessionmaker, MemoryStorage(), file_storage)
+    _detach_routers(monkeypatch)
+    with_extractor = create_dispatcher(sessionmaker, MemoryStorage(), file_storage, FakeExtractor())
+
+    # Свой shutdown-хендлер (закрытие FSM-хранилища) aiogram регистрирует всегда.
+    assert len(without.startup.handlers) == len(with_extractor.startup.handlers) - 1
+    assert len(without.shutdown.handlers) == len(with_extractor.shutdown.handlers) - 1
+
+
 # --- Тексты сообщений -----------------------------------------------------------------------
 
 
@@ -333,6 +378,26 @@ def test_failure_messages_have_no_internals(
     assert reason.value not in text
     if will_retry:
         assert texts.MATERIAL_RETRY_LATER in text
+
+
+def test_messages_promise_automatic_retry_not_next_file() -> None:
+    messages = [
+        texts.MATERIAL_PROCESSING_DEFERRED,
+        texts.material_processing_result(_outcome(kind=OutcomeKind.BUSY, result=None)),
+        texts.material_processing_result(
+            _outcome(
+                kind=OutcomeKind.FAILED,
+                failure_reason=R.DATABASE_ERROR,
+                will_retry=True,
+                result=None,
+            )
+        ),
+    ]
+
+    for message in messages:
+        assert message is not None
+        assert "следующий файл" not in message
+        assert "автоматически" in message
 
 
 @pytest.mark.parametrize("kind", [OutcomeKind.SKIPPED, OutcomeKind.DISCARDED])

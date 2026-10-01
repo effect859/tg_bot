@@ -96,7 +96,7 @@ MATERIAL_COMMIT_UNKNOWN = (
 
 MATERIAL_PROCESSING_DEFERRED = (
     "⏳ Не удалось обработать файлы из-за технической ошибки. "
-    "Повторим, когда вы пришлёте следующий файл."
+    "Повторим автоматически и сообщим результат."
 )
 TEXT_NOT_FOUND = "текст не найден."
 TEXT_LOOKS_SCANNED = (
@@ -112,7 +112,7 @@ TEXT_CHAR_LIMIT = " Документ очень большой: сохранен
 TEXT_TIME_BUDGET = " Документ обрабатывался слишком долго: сохранена только его часть."
 MAX_LISTED_PAGES = 10
 
-MATERIAL_RETRY_LATER = "временная ошибка обработки. Повторим, когда вы пришлёте следующий файл."
+MATERIAL_RETRY_LATER = "временная ошибка обработки. Повторим автоматически и сообщим результат."
 MATERIAL_PROCESSING_FAILED = "не удалось обработать файл. Пришлите его ещё раз."
 MATERIAL_FAILURE_TEXTS: dict[MaterialFailureReason, str] = {
     MaterialFailureReason.FILE_MISSING: "файл не найден в хранилище. Пришлите его ещё раз.",
@@ -139,6 +139,9 @@ MATERIAL_FAILURE_TEXTS: dict[MaterialFailureReason, str] = {
     ),
     MaterialFailureReason.EXTRACTOR_ERROR: (
         "не удалось извлечь текст. Пересохраните файл и пришлите его заново."
+    ),
+    MaterialFailureReason.RESULT_REJECTED: (
+        "не удалось сохранить извлечённый текст. Пересохраните файл и пришлите его заново."
     ),
 }
 
@@ -267,8 +270,8 @@ def material_processing_result(outcome: ProcessingOutcome) -> str | None:
             return material_failed(label, _failure_text(outcome))
         case OutcomeKind.BUSY:
             return (
-                f"⏳ Файл «{label}» ждёт обработки: обработаем его, "
-                "когда вы пришлёте следующий файл."
+                f"⏳ Файл «{label}» ждёт обработки: очередь занята. "
+                "Обработаем его автоматически и сообщим результат."
             )
         case _:
             return None

@@ -5,6 +5,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
     AsyncEngine,
@@ -70,3 +71,30 @@ async def session(
 ) -> AsyncIterator[AsyncSession]:
     async with sessionmaker() as session:
         yield session
+
+
+# tg_id пользователей тестов с настоящими транзакциями: по ним данные удаляются после теста.
+COMMITTED_TG_ID_BASE = 9_000_000_000
+
+
+@pytest.fixture
+async def committed_sessionmaker(
+    engine: AsyncEngine,
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """Сессии как в боте: каждая — своё соединение и настоящие commit (NullPool).
+
+    Для гонок между независимыми сессиями: SAVEPOINT-фикстура выше держит одно
+    соединение, и блокировки строк между её сессиями не действуют. Тест создаёт
+    пользователей с tg_id >= COMMITTED_TG_ID_BASE; их заказы (с материалами и
+    текстами — каскадом) и сами пользователи удаляются после теста.
+    """
+    yield async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        users = "SELECT id FROM users WHERE tg_id >= :base"
+        await connection.execute(
+            text(f"DELETE FROM orders WHERE user_id IN ({users})"),
+            {"base": COMMITTED_TG_ID_BASE},
+        )
+        await connection.execute(
+            text("DELETE FROM users WHERE tg_id >= :base"), {"base": COMMITTED_TG_ID_BASE}
+        )
