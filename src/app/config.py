@@ -19,6 +19,10 @@ class Settings(BaseSettings):
 
     storage_dir: Path = Path("var/storage")
 
+    # RLIMIT_AS дочернего процесса извлечения текста, МиБ (только Linux; 0 — без лимита).
+    # Экспериментальное значение: подобрано на синтетических файлах.
+    extraction_memory_limit_mib: int = 1024
+
 
 @lru_cache
 def get_settings() -> Settings:

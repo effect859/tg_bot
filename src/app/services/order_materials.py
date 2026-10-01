@@ -7,12 +7,13 @@ add_material регистрирует метаданные материала; s
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Order, OrderMaterial
-from app.domain.enums import MaterialProcessingStatus
+from app.domain.enums import MaterialFailureReason, MaterialProcessingStatus
 from app.domain.errors import (
     ConsentNotGivenError,
     MaterialLimitError,
@@ -215,19 +216,18 @@ async def mark_processed(session: AsyncSession, material_id: int) -> OrderMateri
     return await _transition(session, material_id, M.PROCESSED)
 
 
-async def mark_failed(session: AsyncSession, material_id: int, error: str) -> OrderMaterial:
-    if not error.strip():
-        raise ValueError("Processing error description must not be empty")
-    return await _transition(session, material_id, M.FAILED, error=error)
-
-
-async def _transition(
+async def mark_failed(
     session: AsyncSession,
     material_id: int,
-    target: MaterialProcessingStatus,
+    error: str,
     *,
-    error: str | None = None,
+    reason: MaterialFailureReason = MaterialFailureReason.EXTRACTOR_ERROR,
 ) -> OrderMaterial:
+    return await _transition(session, material_id, M.FAILED, error=error, reason=reason)
+
+
+async def lock_material(session: AsyncSession, material_id: int) -> OrderMaterial:
+    """Материал под блокировкой строки (SELECT ... FOR UPDATE) с актуальными полями."""
     stmt = (
         select(OrderMaterial)
         .where(OrderMaterial.id == material_id)
@@ -237,9 +237,44 @@ async def _transition(
     material = await session.scalar(stmt)
     if material is None:
         raise MaterialNotFoundError(material_id)
+    return material
+
+
+def apply_material_status(
+    material: OrderMaterial,
+    target: MaterialProcessingStatus,
+    *,
+    error: str | None = None,
+    reason: MaterialFailureReason | None = None,
+) -> None:
+    """Переход статуса заблокированного материала с согласованными служебными полями.
+
+    PROCESSING начинает новую попытку (счётчик попыток, момент начала); FAILED
+    требует причину и описание ошибки; любой другой статус их сбрасывает.
+    """
     check_material_transition(material.processing_status, target)
+    if target is M.FAILED and (reason is None or not error or not error.strip()):
+        raise ValueError("Processing failure needs a reason and an error description")
     material.processing_status = target
-    material.processing_error = error
+    material.processing_error = error if target is M.FAILED else None
+    material.failure_reason = reason if target is M.FAILED else None
+    if target is M.PROCESSING:
+        material.processing_attempts += 1
+        material.processing_started_at = datetime.now(UTC)
+    else:
+        material.processing_started_at = None
+
+
+async def _transition(
+    session: AsyncSession,
+    material_id: int,
+    target: MaterialProcessingStatus,
+    *,
+    error: str | None = None,
+    reason: MaterialFailureReason | None = None,
+) -> OrderMaterial:
+    material = await lock_material(session, material_id)
+    apply_material_status(material, target, error=error, reason=reason)
     await session.flush()
     await session.refresh(material)
     return material

@@ -28,10 +28,12 @@ from app.domain.enums import (
     DocType,
     FileKind,
     LLMCallStatus,
+    MaterialFailureReason,
     MaterialProcessingStatus,
     OrderStatus,
     PaymentProvider,
     PaymentStatus,
+    TextTruncationReason,
     TransactionReason,
     VersionStatus,
 )
@@ -185,6 +187,15 @@ class OrderMaterial(TimestampMixin, Base):
             "(processing_status = 'failed') = (processing_error IS NOT NULL)",
             name="processing_error_consistent",
         ),
+        CheckConstraint(
+            "(processing_status = 'failed') = (failure_reason IS NOT NULL)",
+            name="processing_failure_reason_consistent",
+        ),
+        CheckConstraint(
+            "(processing_status = 'processing') = (processing_started_at IS NOT NULL)",
+            name="processing_started_at_consistent",
+        ),
+        CheckConstraint("processing_attempts >= 0", name="processing_attempts_non_negative"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -196,14 +207,65 @@ class OrderMaterial(TimestampMixin, Base):
     # MIME, заявленный клиентом; содержимым файла не подтверждён.
     mime_type: Mapped[str | None] = mapped_column(String(255))
     size_bytes: Mapped[int] = mapped_column(BigInteger)
-    # Логический ключ будущего объекта в FileStorage. Наличие ключа не означает,
-    # что файл физически сохранён: сохранение — следующий этап.
+    # Ключ файла в FileStorage; файл сохраняется в той же транзакции, что и строка.
     storage_key: Mapped[str] = mapped_column(String(512))
     processing_status: Mapped[MaterialProcessingStatus] = mapped_column(
         _pg_enum(MaterialProcessingStatus, "material_processing_status"),
         default=MaterialProcessingStatus.RECEIVED,
     )
+    # Технические подробности сбоя — для логов и разработчика, не для пользователя.
     processing_error: Mapped[str | None] = mapped_column(Text)
+    # Машиночитаемая причина сбоя; заполнена тогда и только тогда, когда статус FAILED.
+    failure_reason: Mapped[MaterialFailureReason | None] = mapped_column(
+        _pg_enum(MaterialFailureReason, "material_failure_reason")
+    )
+    # Сколько раз материал брали в обработку; ограничивает повторы.
+    processing_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    # Начало текущей попытки (только в PROCESSING): по нему находится зависшая обработка.
+    processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+# Вне класса: внутри OrderMaterialText имя text занято колонкой.
+_EMPTY_JSONB_ARRAY = text("'[]'::jsonb")
+
+
+class OrderMaterialText(Base):
+    """Текст, извлечённый из материала; есть только у материала в статусе PROCESSED.
+
+    Отдельная таблица: списки материалов не загружают тексты до 500 000 символов.
+    """
+
+    __tablename__ = "order_material_texts"
+    __table_args__ = (
+        CheckConstraint("char_count = char_length(text)", name="char_count_matches"),
+        CheckConstraint(
+            "(page_count IS NULL) = (pages_processed IS NULL)", name="page_counters_together"
+        ),
+        CheckConstraint(
+            "pages_processed >= 0 AND pages_processed <= page_count", name="pages_processed_range"
+        ),
+    )
+
+    material_id: Mapped[int] = mapped_column(
+        ForeignKey("order_materials.id", ondelete="CASCADE"), primary_key=True
+    )
+    # Нормализованный текст (NFC, переводы строк LF, страницы PDF разделены символом FF).
+    text: Mapped[str] = mapped_column(Text)
+    char_count: Mapped[int] = mapped_column(Integer)
+    # Только для PDF: всего страниц и сколько из них обработано.
+    page_count: Mapped[int | None] = mapped_column(Integer)
+    pages_processed: Mapped[int | None] = mapped_column(Integer)
+    # Сохранена только часть текста — почему.
+    truncation_reason: Mapped[TextTruncationReason | None] = mapped_column(
+        _pg_enum(TextTruncationReason, "text_truncation_reason")
+    )
+    # [{"code": ..., "kind": "fact" | "heuristic", "pages": [...]}]
+    warnings: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, default=list, server_default=_EMPTY_JSONB_ARRAY
+    )
+    # Библиотека и версия, например "pypdfium2 5.13.0 / pdfium 153.0.7999.0".
+    extractor: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class OrderFile(Base):

@@ -88,7 +88,7 @@ def _check_docx(data: bytes) -> None:
 
 
 def _check_txt(data: bytes) -> None:
-    text = _decode_text(data)
+    text = decode_text(data)
     if "\x00" in text:
         raise _reject("Text file contains NUL characters")
     _, control = _CONTROL_CHARS.subn("", text)
@@ -96,7 +96,13 @@ def _check_txt(data: bytes) -> None:
         raise _reject("Text file looks binary: too many control characters")
 
 
-def _decode_text(data: bytes) -> str:
+def decode_text(data: bytes) -> str:
+    """Декодирует TXT: UTF-16 с BOM, иначе UTF-8 (с BOM или без), иначе cp1251.
+
+    Общая для проверки при приёме и для извлечения текста (app.extraction).
+
+    Raises UnsupportedMaterialError(reason=CONTENT).
+    """
     if data.startswith(UTF16_BOMS):
         try:
             return data.decode("utf-16")

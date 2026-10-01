@@ -3,7 +3,7 @@
 from html import escape
 
 from app.db.models import Order
-from app.domain.enums import DocType, OrderStatus
+from app.domain.enums import DocType, MaterialFailureReason, OrderStatus, TextTruncationReason
 from app.domain.errors import (
     ConsentNotGivenError,
     MaterialLimitError,
@@ -14,6 +14,8 @@ from app.domain.errors import (
     UnsupportedMaterialError,
 )
 from app.domain.materials import MAX_MATERIAL_SIZE_BYTES, MAX_MATERIALS_PER_ORDER
+from app.extraction.base import WarningCode
+from app.services.material_processing import OutcomeKind, ProcessingOutcome
 
 BTN_NEW_REPORT = "📝 Новый отчёт по практике"
 BTN_MY_ORDERS = "📂 Мои заказы"
@@ -91,6 +93,54 @@ MATERIAL_COMMIT_UNKNOWN = (
     "техническая ошибка при сохранении: не удалось подтвердить, что файл принят. "
     "Отправьте его ещё раз."
 )
+
+MATERIAL_PROCESSING_DEFERRED = (
+    "⏳ Не удалось обработать файлы из-за технической ошибки. "
+    "Повторим, когда вы пришлёте следующий файл."
+)
+TEXT_NOT_FOUND = "текст не найден."
+TEXT_LOOKS_SCANNED = (
+    " Похоже, это скан или изображения: распознавание текста с картинок пока не поддерживается."
+)
+TEXT_SEND_TEXT_VERSION = (
+    " Пришлите версию с текстом: DOCX, TXT или PDF, сохранённый из текстового редактора."
+)
+TEXT_LOW_QUALITY = (
+    " Часть текста может быть извлечена неверно — если есть DOCX-версия, пришлите её."
+)
+TEXT_CHAR_LIMIT = " Документ очень большой: сохранена только его начальная часть."
+TEXT_TIME_BUDGET = " Документ обрабатывался слишком долго: сохранена только его часть."
+MAX_LISTED_PAGES = 10
+
+MATERIAL_RETRY_LATER = "временная ошибка обработки. Повторим, когда вы пришлёте следующий файл."
+MATERIAL_PROCESSING_FAILED = "не удалось обработать файл. Пришлите его ещё раз."
+MATERIAL_FAILURE_TEXTS: dict[MaterialFailureReason, str] = {
+    MaterialFailureReason.FILE_MISSING: "файл не найден в хранилище. Пришлите его ещё раз.",
+    MaterialFailureReason.CORRUPTED: (
+        "файл повреждён или не читается. Проверьте его и пришлите заново."
+    ),
+    MaterialFailureReason.ENCRYPTED: (
+        "файл защищён паролем. Снимите защиту и пришлите его заново."
+    ),
+    MaterialFailureReason.EMPTY_DOCUMENT: "в документе нет ни одной страницы.",
+    MaterialFailureReason.UNSUPPORTED: (
+        "документ содержит неподдерживаемые элементы. Пересохраните его в Word или "
+        "LibreOffice и пришлите заново."
+    ),
+    MaterialFailureReason.LIMIT_EXCEEDED: (
+        "документ слишком объёмный или сложный для обработки. Сохраните его в "
+        "упрощённом виде и пришлите заново."
+    ),
+    MaterialFailureReason.TIMEOUT: (
+        "документ обрабатывался слишком долго. Сохраните его в упрощённом виде и пришлите заново."
+    ),
+    MaterialFailureReason.EXTRACTOR_CRASH: (
+        "не удалось извлечь текст. Пересохраните файл и пришлите его заново."
+    ),
+    MaterialFailureReason.EXTRACTOR_ERROR: (
+        "не удалось извлечь текст. Пересохраните файл и пришлите его заново."
+    ),
+}
 
 NO_ORDERS = "У вас пока нет заказов."
 
@@ -199,3 +249,84 @@ def material_rejection(error: OrderDomainError) -> str:
             return f"сейчас файлы не принимаются: заказ на шаге «{status_label(status)}»."
         case _:
             return MATERIAL_REJECTED
+
+
+def material_processing_result(outcome: ProcessingOutcome) -> str | None:
+    """Сообщение о результате обработки материала; None — сообщать нечего.
+
+    Без технических подробностей: причина сбоя и эвристики — только понятным текстом.
+    """
+    if not outcome.order_active:
+        return None
+    label = file_label(outcome.original_filename)
+    match outcome.kind:
+        case OutcomeKind.PROCESSED:
+            assert outcome.result is not None
+            return _text_extracted(label, outcome)
+        case OutcomeKind.FAILED:
+            return material_failed(label, _failure_text(outcome))
+        case OutcomeKind.BUSY:
+            return (
+                f"⏳ Файл «{label}» ждёт обработки: обработаем его, "
+                "когда вы пришлёте следующий файл."
+            )
+        case _:
+            return None
+
+
+def _failure_text(outcome: ProcessingOutcome) -> str:
+    if outcome.will_retry:
+        return MATERIAL_RETRY_LATER
+    assert outcome.failure_reason is not None
+    return MATERIAL_FAILURE_TEXTS.get(outcome.failure_reason, MATERIAL_PROCESSING_FAILED)
+
+
+def _text_extracted(label: str, outcome: ProcessingOutcome) -> str:
+    result = outcome.result
+    assert result is not None
+    image_only = next((w for w in result.warnings if w.code is WarningCode.IMAGE_ONLY_PAGES), None)
+    if result.has_warning(WarningCode.NO_TEXT):
+        text = f"⚠️ Файл «{label}»: {TEXT_NOT_FOUND}"
+        if image_only is not None:
+            text += TEXT_LOOKS_SCANNED
+        return text + TEXT_SEND_TEXT_VERSION
+
+    text = f"📄 Файл «{label}»: текст извлечён"
+    if result.page_count is not None:
+        text += f" ({result.page_count} стр.)"
+    text += "."
+    for warning in result.warnings:
+        if warning.code is WarningCode.PAGES_WITHOUT_TEXT:
+            text += f" На страницах {format_pages(warning.pages)} текста нет"
+            text += " — возможно, это сканы." if image_only is not None else "."
+        elif warning.code is WarningCode.LOW_QUALITY_TEXT:
+            text += TEXT_LOW_QUALITY
+    match result.truncation:
+        case TextTruncationReason.PAGE_LIMIT:
+            text += (
+                f" Обработаны только первые {result.pages_processed} страниц "
+                f"из {result.page_count}."
+            )
+        case TextTruncationReason.CHAR_LIMIT:
+            text += TEXT_CHAR_LIMIT
+        case TextTruncationReason.TIME_BUDGET:
+            text += TEXT_TIME_BUDGET
+    return text
+
+
+def format_pages(pages: tuple[int, ...]) -> str:
+    """``(1, 2, 3, 5)`` -> ``"1–3, 5"``; длинный список обрезается."""
+    ranges: list[str] = []
+    start = prev = None
+    for page in sorted(pages):
+        if prev is not None and page == prev + 1:
+            prev = page
+            continue
+        if start is not None:
+            ranges.append(str(start) if start == prev else f"{start}–{prev}")
+        start = prev = page
+    if start is not None:
+        ranges.append(str(start) if start == prev else f"{start}–{prev}")
+    if len(ranges) > MAX_LISTED_PAGES:
+        return ", ".join(ranges[:MAX_LISTED_PAGES]) + " и другие"
+    return ", ".join(ranges)

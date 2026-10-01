@@ -32,6 +32,8 @@ from app.domain.errors import (
     OrderNotFoundError,
 )
 from app.domain.materials import MAX_MATERIAL_SIZE_BYTES
+from app.extraction.base import TextExtractor
+from app.services.material_processing import process_pending_materials
 from app.services.order_materials import (
     MaterialStorageError,
     ensure_can_add_material,
@@ -160,6 +162,7 @@ async def receive_document(
     user: User,
     bot: Bot,
     file_storage: FileStorage,
+    text_extractor: TextExtractor | None = None,
 ) -> None:
     document = message.document
     assert document is not None  # гарантирует фильтр F.document
@@ -246,6 +249,35 @@ async def receive_document(
         return
     # upload_order = число материалов заказа: материалы не удаляются.
     await message.answer(texts.material_accepted(label, upload_order))
+    if text_extractor is not None:
+        await _process_materials(message, session, file_storage, text_extractor, order_id)
+
+
+async def _process_materials(
+    message: Message,
+    session: AsyncSession,
+    file_storage: FileStorage,
+    text_extractor: TextExtractor,
+    order_id: int,
+) -> None:
+    """Извлечение текста после приёма файла — в том же апдейте, без фоновых задач.
+
+    Обрабатывается новый файл и материалы заказа, ждущие повтора. Сбой обработки
+    не отменяет приём: материал и его файл остаются, статус — в БД.
+    """
+    try:
+        outcomes = await process_pending_materials(session, file_storage, text_extractor, order_id)
+    except Exception:
+        # Ошибка БД или непредвиденный сбой. Материал, оставшийся в PROCESSING, будет
+        # признан прерванным и обработан заново; файл не затрагивается.
+        logger.exception("Material processing failed: order_id=%s", order_id)
+        await _rollback_quietly(session)
+        await message.answer(texts.MATERIAL_PROCESSING_DEFERRED)
+        return
+    for outcome in outcomes:
+        text = texts.material_processing_result(outcome)
+        if text is not None:
+            await message.answer(text)
 
 
 async def _reject(message: Message, order_id: int, label: str, error: OrderDomainError) -> None:

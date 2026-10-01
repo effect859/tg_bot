@@ -7,7 +7,9 @@ MIME, размер), но не содержимое: клиент может п�
 app.domain.material_content, она выполняется при приёме файла, до создания материала.
 """
 
-from app.domain.enums import MaterialProcessingStatus, OrderStatus
+from datetime import timedelta
+
+from app.domain.enums import MaterialFailureReason, MaterialProcessingStatus, OrderStatus
 from app.domain.errors import (
     InvalidMaterialTransitionError,
     MaterialRejectReason,
@@ -44,6 +46,25 @@ MATERIAL_TRANSITIONS: dict[MaterialProcessingStatus, frozenset[MaterialProcessin
     M.FAILED: frozenset({M.PROCESSING}),
     M.PROCESSED: frozenset(),
 }
+
+R = MaterialFailureReason
+
+# Сколько раз материал можно взять в обработку (первая попытка и повторы).
+MAX_PROCESSING_ATTEMPTS = 3
+# Повтор имеет смысл только для сбоев, не связанных с содержимым файла. Остальные
+# причины (повреждён, зашифрован, тайм-аут, аварийное завершение) повторяются с тем
+# же исходом: пользователь заменяет файл новым.
+RETRYABLE_FAILURE_REASONS: frozenset[MaterialFailureReason] = frozenset(
+    {R.STORAGE_ERROR, R.EXTRACTOR_UNAVAILABLE, R.INTERRUPTED}
+)
+# Материал считается прерванным, если он в PROCESSING дольше этого времени с начала
+# текущей попытки (processing_started_at). Момент начала ставится при захвате, когда
+# место в очереди извлечения уже получено, — ожидание очереди сюда не входит. Попытка
+# укладывается в чтение файла, жёсткий тайм-аут дочернего процесса (30 с), дочитывание
+# его каналов (до 10 с) и сохранение; остальное — запас. Прерванный материал находит
+# только следующая обработка материалов заказа: переводит его в FAILED с причиной
+# INTERRUPTED и, если попытки не исчерпаны, берёт заново.
+STALE_PROCESSING_AFTER = timedelta(minutes=3)
 
 
 def check_material(filename: str, mime_type: str | None, size_bytes: int | None) -> str:
@@ -92,6 +113,10 @@ def is_supported_material(filename: str, mime_type: str | None, size_bytes: int 
     except UnsupportedMaterialError:
         return False
     return True
+
+
+def is_retryable_failure(reason: MaterialFailureReason | None, attempts: int) -> bool:
+    return reason in RETRYABLE_FAILURE_REASONS and attempts < MAX_PROCESSING_ATTEMPTS
 
 
 def check_material_transition(

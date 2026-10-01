@@ -9,6 +9,7 @@ from aiogram.fsm.storage.redis import RedisStorage
 from app.bot.setup import create_dispatcher
 from app.config import get_settings
 from app.db.session import create_engine, create_sessionmaker
+from app.extraction.runner import SubprocessTextExtractor
 from app.logging_setup import setup_logging
 from app.services.storage.local import LocalFileStorage
 
@@ -25,8 +26,14 @@ async def main() -> None:
         token=settings.bot_token.get_secret_value(),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    text_extractor = SubprocessTextExtractor(
+        memory_limit_bytes=settings.extraction_memory_limit_mib * 1024 * 1024
+    )
     dispatcher = create_dispatcher(
-        create_sessionmaker(engine), storage, LocalFileStorage(settings.storage_dir)
+        create_sessionmaker(engine),
+        storage,
+        LocalFileStorage(settings.storage_dir),
+        text_extractor,
     )
 
     logger.info("Bot is starting (polling)")

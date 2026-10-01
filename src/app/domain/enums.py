@@ -48,6 +48,45 @@ class MaterialProcessingStatus(StrEnum):
     FAILED = "failed"
 
 
+class MaterialFailureReason(StrEnum):
+    """Почему материал в статусе FAILED. Какие причины допускают повтор — в app.domain.materials.
+
+    Подробности для разработчика — в OrderMaterial.processing_error, пользователю не показываются.
+    """
+
+    # Файла нет в хранилище: нарушение целостности, а не ошибка извлечения.
+    FILE_MISSING = "file_missing"
+    # Хранилище не смогло прочитать файл.
+    STORAGE_ERROR = "storage_error"
+    CORRUPTED = "corrupted"
+    # Нужен пароль или неподдерживаемая защита.
+    ENCRYPTED = "encrypted"
+    # PDF открылся, но в нём 0 страниц.
+    EMPTY_DOCUMENT = "empty_document"
+    # Конструкция, которую мы сознательно не разбираем (DOCTYPE в DOCX, метод сжатия ZIP).
+    UNSUPPORTED = "unsupported"
+    # Превышен ресурсный лимит до получения текста (размер частей ZIP, лимит парсера, память).
+    LIMIT_EXCEEDED = "limit_exceeded"
+    # Дочерний процесс не уложился в жёсткий тайм-аут и снят.
+    TIMEOUT = "timeout"
+    # Дочерний процесс завершился аварийно, без результата (сигнал, код выхода).
+    EXTRACTOR_CRASH = "extractor_crash"
+    # Неожиданное исключение в извлечении или некорректный ответ дочернего процесса.
+    EXTRACTOR_ERROR = "extractor_error"
+    # Дочерний процесс не удалось запустить.
+    EXTRACTOR_UNAVAILABLE = "extractor_unavailable"
+    # Обработка зависла в PROCESSING (например, бот перезапустился посреди работы).
+    INTERRUPTED = "interrupted"
+
+
+class TextTruncationReason(StrEnum):
+    """Почему сохранена только часть текста материала."""
+
+    PAGE_LIMIT = "page_limit"
+    CHAR_LIMIT = "char_limit"
+    TIME_BUDGET = "time_budget"
+
+
 class FileKind(StrEnum):
     INPUT = "input"
     OUTPUT = "output"
