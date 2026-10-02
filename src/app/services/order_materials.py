@@ -1,21 +1,24 @@
-"""Материалы заказа: приём файлов и статус обработки.
+"""Материалы заказа: приём файлов, статус обработки и завершение приёма.
 
 add_material регистрирует метаданные материала; store_material дополнительно
 проверяет содержимое и сохраняет байты в FileStorage. Путь хранения — storage_key,
-имя файла пользователя в него не попадает. Коммит — забота вызывающего кода.
+имя файла пользователя в него не попадает. finish_materials завершает приём и
+переводит заказ к анализу материалов. Коммит — забота вызывающего кода.
 """
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Order, OrderMaterial
-from app.domain.enums import MaterialFailureReason, MaterialProcessingStatus
+from app.db.models import Order, OrderMaterial, OrderMaterialText
+from app.domain.enums import MaterialFailureReason, MaterialProcessingStatus, OrderStatus
 from app.domain.errors import (
     ConsentNotGivenError,
+    InvalidStatusTransitionError,
     MaterialLimitError,
     MaterialNotFoundError,
     MaterialsLockedError,
@@ -26,10 +29,14 @@ from app.domain.material_content import check_material_content
 from app.domain.materials import (
     MATERIAL_ACCEPTING_STATUSES,
     MAX_MATERIALS_PER_ORDER,
+    MaterialCompletionState,
     check_material,
     check_material_transition,
+    check_materials_ready,
+    material_completion_state,
 )
-from app.services.orders import has_confirmed_requirements, lock_order
+from app.domain.order_flow import check_transition
+from app.services.orders import change_status, has_confirmed_requirements, lock_order
 from app.services.storage.base import FileStorage
 
 logger = logging.getLogger(__name__)
@@ -89,7 +96,8 @@ async def add_material(
     """Регистрирует новый материал заказа в статусе RECEIVED.
 
     Блокировка заказа упорядочивает параллельные добавления (upload_order) и
-    исключает гонку с подтверждением ТЗ, которое блокирует ту же строку.
+    исключает гонку с завершением приёма (finish_materials) и подтверждением ТЗ,
+    которые блокируют ту же строку.
     """
     order = await lock_order(session, order_id)
     await _check_order_accepts_materials(session, order)
@@ -189,6 +197,77 @@ async def _discard_file(storage: FileStorage, storage_key: str) -> None:
     except Exception:
         # Не маскируем исходную ошибку: сирота останется, ключ — в логе.
         logger.exception("Failed to delete file of rolled back material: %s", storage_key)
+
+
+@dataclass(frozen=True)
+class MaterialSummary:
+    """Материал в итоге завершения приёма: без технических подробностей сбоя."""
+
+    upload_order: int
+    original_filename: str
+    state: MaterialCompletionState
+    failure_reason: MaterialFailureReason | None = None
+
+
+@dataclass(frozen=True)
+class MaterialsCompletion:
+    order: Order
+    materials: list[MaterialSummary]
+
+    def count(self, state: MaterialCompletionState) -> int:
+        return sum(1 for m in self.materials if m.state is state)
+
+
+async def finish_materials(session: AsyncSession, order_id: int) -> MaterialsCompletion:
+    """Завершает приём материалов: WAITING_FOR_FILES -> ANALYZING_MATERIALS.
+
+    Переход — только если материалы готовы (check_materials_ready). Заказ
+    блокируется до проверки: новый материал (add_material блокирует ту же строку) не
+    может появиться между проверкой и commit. Материалы не блокируются: окончательные
+    состояния (обработан, окончательный сбой) больше не меняются, а незавершённый
+    материал и так означает отказ. Коммит — забота вызывающего кода; при отказе
+    ничего не меняется.
+
+    Raises OrderNotFoundError, InvalidStatusTransitionError (приём уже завершён или
+    заказ на другом шаге), MaterialsNotReadyError.
+    """
+    target = OrderStatus.ANALYZING_MATERIALS
+    order = await lock_order(session, order_id)
+    # Карта переходов ведёт в анализ и из других шагов (повторный анализ из
+    # WAITING_FOR_MISSING_DATA, возврат из FAILED) — завершение приёма только из загрузки:
+    # старая кнопка «Материалы загружены» не должна запускать анализ заново.
+    if order.status is not OrderStatus.WAITING_FOR_FILES:
+        raise InvalidStatusTransitionError(order.status, target)
+    check_transition(order.status, target, order.failed_from_status)
+
+    stmt = (
+        select(OrderMaterial, OrderMaterialText.char_count)
+        .outerjoin(OrderMaterialText, OrderMaterialText.material_id == OrderMaterial.id)
+        .where(OrderMaterial.order_id == order_id)
+        .order_by(OrderMaterial.upload_order)
+    )
+    summaries: list[MaterialSummary] = []
+    for material, char_count in (await session.execute(stmt)).all():
+        state = material_completion_state(
+            material.processing_status,
+            material.failure_reason,
+            material.processing_attempts,
+            char_count,
+        )
+        summaries.append(
+            MaterialSummary(
+                upload_order=material.upload_order,
+                original_filename=material.original_filename,
+                state=state,
+                failure_reason=(
+                    material.failure_reason if state is MaterialCompletionState.FAILED else None
+                ),
+            )
+        )
+    check_materials_ready(summary.state for summary in summaries)
+
+    order = await change_status(session, order_id, target)
+    return MaterialsCompletion(order=order, materials=summaries)
 
 
 async def get_order_materials(session: AsyncSession, order_id: int) -> list[OrderMaterial]:

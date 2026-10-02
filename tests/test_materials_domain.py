@@ -1,20 +1,32 @@
+import itertools
+
 import pytest
 
+from app.domain.enums import MaterialFailureReason as R
 from app.domain.enums import MaterialProcessingStatus as M
 from app.domain.enums import OrderStatus
 from app.domain.errors import (
     InvalidMaterialTransitionError,
     MaterialRejectReason,
+    MaterialsNotReadyError,
+    MaterialsNotReadyReason,
     UnsupportedMaterialError,
 )
 from app.domain.materials import (
     MATERIAL_ACCEPTING_STATUSES,
     MATERIAL_TRANSITIONS,
     MAX_MATERIAL_SIZE_BYTES,
+    MAX_PROCESSING_ATTEMPTS,
+    MaterialCompletionState,
     check_material,
     check_material_transition,
+    check_materials_ready,
+    is_retryable_failure,
     is_supported_material,
+    material_completion_state,
 )
+
+C = MaterialCompletionState
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
@@ -108,13 +120,79 @@ def test_failed_can_be_retried() -> None:
     assert MATERIAL_TRANSITIONS[M.PROCESSED] == frozenset()
 
 
-def test_materials_accepted_after_consent_and_before_payment() -> None:
-    assert OrderStatus.NEW not in MATERIAL_ACCEPTING_STATUSES
-    assert OrderStatus.WAITING_FOR_CONSENT not in MATERIAL_ACCEPTING_STATUSES
-    assert OrderStatus.WAITING_FOR_FILES in MATERIAL_ACCEPTING_STATUSES
-    assert OrderStatus.WAITING_FOR_MISSING_DATA in MATERIAL_ACCEPTING_STATUSES
-    for status in (OrderStatus.PAID, OrderStatus.COMPLETED, OrderStatus.CANCELLED):
-        assert status not in MATERIAL_ACCEPTING_STATUSES
+def test_materials_accepted_only_while_waiting_for_files() -> None:
+    """Stage 2.6: после завершения приёма (ANALYZING_MATERIALS и дальше) файлы не принимаются."""
+    assert frozenset({OrderStatus.WAITING_FOR_FILES}) == MATERIAL_ACCEPTING_STATUSES
+
+
+# --- Завершение приёма материалов --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "attempts", "char_count", "expected"),
+    [
+        (M.RECEIVED, None, 0, None, C.PENDING),
+        (M.PROCESSING, None, 1, None, C.PENDING),
+        (M.FAILED, R.STORAGE_ERROR, 1, None, C.PENDING),
+        (M.FAILED, R.DATABASE_ERROR, MAX_PROCESSING_ATTEMPTS - 1, None, C.PENDING),
+        (M.FAILED, R.STORAGE_ERROR, MAX_PROCESSING_ATTEMPTS, None, C.FAILED),
+        (M.FAILED, R.CORRUPTED, 1, None, C.FAILED),
+        (M.FAILED, R.RESULT_REJECTED, 1, None, C.FAILED),
+        (M.PROCESSED, None, 1, 120, C.WITH_TEXT),
+        (M.PROCESSED, None, 1, 0, C.WITHOUT_TEXT),
+        (M.PROCESSED, None, 1, None, C.WITHOUT_TEXT),
+    ],
+)
+def test_material_completion_state(
+    status: M, reason: R | None, attempts: int, char_count: int | None, expected: C
+) -> None:
+    assert material_completion_state(status, reason, attempts, char_count) is expected
+
+
+@pytest.mark.parametrize(
+    ("states", "reason", "pending"),
+    [
+        ([], MaterialsNotReadyReason.NO_MATERIALS, 0),
+        ([C.PENDING, C.PENDING], MaterialsNotReadyReason.PENDING, 2),
+        ([C.WITH_TEXT, C.PENDING], MaterialsNotReadyReason.PENDING, 1),
+        ([C.FAILED, C.FAILED], MaterialsNotReadyReason.NO_TEXT, 0),
+        ([C.WITHOUT_TEXT, C.FAILED], MaterialsNotReadyReason.NO_TEXT, 0),
+    ],
+)
+def test_materials_not_ready(
+    states: list[C], reason: MaterialsNotReadyReason, pending: int
+) -> None:
+    with pytest.raises(MaterialsNotReadyError) as caught:
+        check_materials_ready(states)
+
+    assert (caught.value.reason, caught.value.pending) == (reason, pending)
+
+
+@pytest.mark.parametrize(
+    "states",
+    [[C.WITH_TEXT], [C.WITH_TEXT, C.FAILED, C.WITHOUT_TEXT], [C.FAILED, C.WITH_TEXT]],
+)
+def test_materials_ready(states: list[C]) -> None:
+    check_materials_ready(states)
+
+
+def test_finished_states_never_change() -> None:
+    """Всё, что не PENDING, — окончательно: обработка и восстановление его не тронут.
+
+    На этом держится завершение приёма без блокировки материалов.
+    """
+    for status, reason, attempts in itertools.product(
+        M, [None, *R], range(MAX_PROCESSING_ATTEMPTS + 1)
+    ):
+        for char_count in (None, 0, 10):
+            state = material_completion_state(status, reason, attempts, char_count)
+            if state is C.PENDING:
+                continue
+            assert status in (M.PROCESSED, M.FAILED)
+            if status is M.PROCESSED:
+                assert MATERIAL_TRANSITIONS[M.PROCESSED] == frozenset()
+            else:
+                assert not is_retryable_failure(reason, attempts)
 
 
 @pytest.mark.parametrize(

@@ -7,15 +7,18 @@ MIME, размер), но не содержимое: клиент может п�
 app.domain.material_content, она выполняется при приёме файла, до создания материала.
 """
 
+from collections.abc import Iterable
 from datetime import timedelta
+from enum import StrEnum
 
 from app.domain.enums import MaterialFailureReason, MaterialProcessingStatus, OrderStatus
 from app.domain.errors import (
     InvalidMaterialTransitionError,
     MaterialRejectReason,
+    MaterialsNotReadyError,
+    MaterialsNotReadyReason,
     UnsupportedMaterialError,
 )
-from app.domain.order_flow import PRE_PAYMENT_STATUSES
 
 M = MaterialProcessingStatus
 
@@ -32,12 +35,13 @@ SUPPORTED_MATERIAL_TYPES: dict[str, frozenset[str]] = {
 # Клиент не знает тип файла — решает расширение.
 UNKNOWN_MIME_TYPES: frozenset[str] = frozenset({"application/octet-stream"})
 
-# Материалы принимаются после согласия и до оплаты. Дополнительно add_material
-# запрещает добавление после подтверждения ТЗ — это проверяется по данным в БД.
-MATERIAL_ACCEPTING_STATUSES: frozenset[OrderStatus] = PRE_PAYMENT_STATUSES - {
-    OrderStatus.NEW,
-    OrderStatus.WAITING_FOR_CONSENT,
-}
+# Материалы принимаются только на шаге загрузки: после согласия и до того, как
+# пользователь завершит приём (finish_materials). Набор задаёт и то, где материалы
+# обрабатываются и восстанавливаются: завершить приём можно только когда обработка
+# всех материалов закончена, поэтому дальше обрабатывать нечего. Дополнительно
+# add_material запрещает добавление после подтверждения ТЗ — защита на случай, если
+# ТЗ подтверждено раньше завершения приёма.
+MATERIAL_ACCEPTING_STATUSES: frozenset[OrderStatus] = frozenset({OrderStatus.WAITING_FOR_FILES})
 
 MATERIAL_TRANSITIONS: dict[MaterialProcessingStatus, frozenset[MaterialProcessingStatus]] = {
     M.RECEIVED: frozenset({M.PROCESSING}),
@@ -64,7 +68,8 @@ RETRYABLE_FAILURE_REASONS: frozenset[MaterialFailureReason] = frozenset(
 # его каналов (до 10 с) и сохранение; остальное — запас. Прерванный материал находит
 # следующая обработка материалов заказа или проход восстановления
 # (app.services.material_recovery): переводит его в FAILED с причиной INTERRUPTED и,
-# если попытки не исчерпаны, берёт заново.
+# если заказ ещё принимает материалы (MATERIAL_ACCEPTING_STATUSES) и попытки не
+# исчерпаны, берёт заново.
 STALE_PROCESSING_AFTER = timedelta(minutes=3)
 # Проход восстановления берёт RECEIVED только старше этого: свежий материал
 # обрабатывает апдейт, в котором его прислали (он может ждать очередь извлечения до
@@ -122,6 +127,53 @@ def is_supported_material(filename: str, mime_type: str | None, size_bytes: int 
 
 def is_retryable_failure(reason: MaterialFailureReason | None, attempts: int) -> bool:
     return reason in RETRYABLE_FAILURE_REASONS and attempts < MAX_PROCESSING_ATTEMPTS
+
+
+class MaterialCompletionState(StrEnum):
+    """Состояние материала с точки зрения завершения приёма."""
+
+    # Обработка не закончена: новый, в работе или ждёт повтора.
+    PENDING = "pending"
+    WITH_TEXT = "with_text"
+    # Обработан, но текста нет (скан, изображения) — для анализа непригоден.
+    WITHOUT_TEXT = "without_text"
+    # Окончательный сбой: причина без повтора или попытки исчерпаны.
+    FAILED = "failed"
+
+
+def material_completion_state(
+    status: MaterialProcessingStatus,
+    failure_reason: MaterialFailureReason | None,
+    attempts: int,
+    char_count: int | None,
+) -> MaterialCompletionState:
+    """``char_count`` — длина сохранённого текста; None — строки текста нет.
+
+    PENDING — ровно то, что ещё может взять обработка или восстановление: RECEIVED,
+    PROCESSING (в работе или прерванный) и FAILED, который будет повторён.
+    """
+    if status is M.PROCESSED:
+        if char_count:
+            return MaterialCompletionState.WITH_TEXT
+        return MaterialCompletionState.WITHOUT_TEXT
+    if status is M.FAILED and not is_retryable_failure(failure_reason, attempts):
+        return MaterialCompletionState.FAILED
+    return MaterialCompletionState.PENDING
+
+
+def check_materials_ready(states: Iterable[MaterialCompletionState]) -> None:
+    """Можно ли завершить приём материалов: есть материалы, все обработаны, есть текст.
+
+    Raises MaterialsNotReadyError.
+    """
+    states = list(states)
+    if not states:
+        raise MaterialsNotReadyError(MaterialsNotReadyReason.NO_MATERIALS)
+    pending = states.count(MaterialCompletionState.PENDING)
+    if pending:
+        raise MaterialsNotReadyError(MaterialsNotReadyReason.PENDING, pending=pending)
+    if MaterialCompletionState.WITH_TEXT not in states:
+        raise MaterialsNotReadyError(MaterialsNotReadyReason.NO_TEXT)
 
 
 def check_material_transition(

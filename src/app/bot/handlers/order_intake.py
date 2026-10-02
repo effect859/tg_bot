@@ -1,14 +1,15 @@
-"""Оформление заказа: создание, согласие, приём материалов, отмена.
+"""Оформление заказа: создание, согласие, приём материалов, завершение приёма, отмена.
 
 Источник истины о шаге заказа — его статус в БД, FSM-состояния не используются.
 Документ всегда прикрепляется к активному заказу отправителя; order_id из кнопок
-проверяется на принадлежность пользователю. Правила приёма файлов — в домене и
-сервисах, здесь только перевод ошибок в сообщения.
+проверяется на принадлежность пользователю. Правила приёма файлов и готовности
+материалов — в домене и сервисах, здесь только перевод ошибок в сообщения.
 """
 
 import logging
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +21,7 @@ from app.bot.keyboards import (
     cancel_order_keyboard,
     consent_keyboard,
     main_menu_keyboard,
+    materials_keyboard,
 )
 from app.bot.telegram_files import FileDownloadError, FileTooLargeError, download_document
 from app.db.models import Order, User
@@ -28,6 +30,7 @@ from app.domain.errors import (
     ActiveOrderExistsError,
     ConsentNotGivenError,
     InvalidStatusTransitionError,
+    MaterialsNotReadyError,
     OrderDomainError,
     OrderNotFoundError,
 )
@@ -37,6 +40,7 @@ from app.services.material_processing import process_pending_materials
 from app.services.order_materials import (
     MaterialStorageError,
     ensure_can_add_material,
+    finish_materials,
     store_material,
 )
 from app.services.orders import change_status, create_order, get_active_order, get_user_order
@@ -80,7 +84,7 @@ async def _remind_active_order(message: Message, order: Order) -> None:
         await message.answer(texts.CONSENT_REQUEST, reply_markup=consent_keyboard(order.id))
     elif order.status is S.WAITING_FOR_FILES:
         await message.answer(
-            texts.waiting_for_files(order), reply_markup=cancel_order_keyboard(order.id)
+            texts.waiting_for_files(order), reply_markup=materials_keyboard(order.id)
         )
     else:
         await message.answer(texts.active_order_exists(order))
@@ -142,6 +146,61 @@ async def _change_user_order(
     await session.commit()
     await callback.answer()
     return order
+
+
+@router.callback_query(OrderCallback.filter(F.action == OrderAction.FINISH_MATERIALS))
+async def finish_order_materials(
+    callback: CallbackQuery,
+    callback_data: OrderCallback,
+    session: AsyncSession,
+    user: User,
+    bot: Bot,
+) -> None:
+    """«Материалы загружены»: WAITING_FOR_FILES -> ANALYZING_MATERIALS.
+
+    Готовность материалов проверяет сервис под блокировкой заказа. При отказе
+    транзакция откатывается до ответа в Telegram: блокировка заказа не держится во
+    время сетевого запроса. Повторное и устаревшее нажатие упирается в карту переходов.
+    """
+    try:
+        order = await get_user_order(session, user.id, callback_data.order_id)
+    except OrderNotFoundError:
+        await session.rollback()
+        await callback.answer(texts.ORDER_NOT_FOUND, show_alert=True)
+        return
+    try:
+        completion = await finish_materials(session, order.id)
+    except InvalidStatusTransitionError:
+        # lock_order обновил order актуальным статусом. Текст — до rollback: после него
+        # объекты сессии устаревают.
+        if order.status is S.ANALYZING_MATERIALS:
+            refusal = texts.materials_already_finished(order)
+        else:
+            refusal = texts.action_outdated(order)
+        await session.rollback()
+        await callback.answer(refusal, show_alert=True)
+        return
+    except MaterialsNotReadyError as error:
+        await session.rollback()
+        await callback.answer(texts.materials_not_ready(error), show_alert=True)
+        return
+    await session.commit()
+    await callback.answer()
+    await _remove_keyboard(callback, bot)
+    await _send(callback, bot, texts.materials_completed(completion))
+
+
+async def _remove_keyboard(callback: CallbackQuery, bot: Bot) -> None:
+    """Снимает кнопки с нажатого сообщения. Переход уже зафиксирован: сбой не важен."""
+    message = callback.message
+    if not isinstance(message, Message):
+        return  # Сообщение недоступно боту (удалено или слишком старое).
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=message.chat.id, message_id=message.message_id, reply_markup=None
+        )
+    except TelegramAPIError:
+        logger.warning("Failed to remove keyboard: message_id=%s", message.message_id)
 
 
 async def _send(
@@ -248,7 +307,9 @@ async def receive_document(
         await message.answer(texts.material_failed(label, texts.MATERIAL_COMMIT_UNKNOWN))
         return
     # upload_order = число материалов заказа: материалы не удаляются.
-    await message.answer(texts.material_accepted(label, upload_order))
+    await message.answer(
+        texts.material_accepted(label, upload_order), reply_markup=materials_keyboard(order_id)
+    )
     if text_extractor is not None:
         await _process_materials(message, session, file_storage, text_extractor, order_id)
 

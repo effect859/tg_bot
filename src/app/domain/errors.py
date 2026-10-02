@@ -112,6 +112,25 @@ class UnsupportedMaterialError(OrderDomainError):
         self.reason = reason
 
 
+class MaterialsNotReadyReason(StrEnum):
+    """Почему приём материалов нельзя завершить: по причине бот выбирает сообщение."""
+
+    NO_MATERIALS = "no_materials"
+    # Есть материалы, обработка которых ещё не завершена (в том числе ждущие повтора).
+    PENDING = "pending"
+    # Обработка завершена, но ни из одного материала не получен непустой текст.
+    NO_TEXT = "no_text"
+
+
+class MaterialsNotReadyError(OrderDomainError):
+    """Материалы заказа не готовы: перейти к анализу нельзя."""
+
+    def __init__(self, reason: MaterialsNotReadyReason, *, pending: int = 0) -> None:
+        super().__init__(f"Materials are not ready: {reason}, pending={pending}")
+        self.reason = reason
+        self.pending = pending
+
+
 class MaterialNotFoundError(OrderDomainError):
     def __init__(self, material_id: int) -> None:
         super().__init__(f"Material {material_id} not found")

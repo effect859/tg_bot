@@ -10,12 +10,19 @@ from app.domain.errors import (
     MaterialRejectReason,
     MaterialsLockedError,
     MaterialsNotAcceptedError,
+    MaterialsNotReadyError,
+    MaterialsNotReadyReason,
     OrderDomainError,
     UnsupportedMaterialError,
 )
-from app.domain.materials import MAX_MATERIAL_SIZE_BYTES, MAX_MATERIALS_PER_ORDER
+from app.domain.materials import (
+    MAX_MATERIAL_SIZE_BYTES,
+    MAX_MATERIALS_PER_ORDER,
+    MaterialCompletionState,
+)
 from app.extraction.base import WarningCode
 from app.services.material_processing import OutcomeKind, ProcessingOutcome
+from app.services.order_materials import MaterialsCompletion
 
 BTN_NEW_REPORT = "📝 Новый отчёт по практике"
 BTN_MY_ORDERS = "📂 Мои заказы"
@@ -47,6 +54,8 @@ ORDER_STATUS_LABELS: dict[OrderStatus, str] = {
 
 BTN_CONSENT = "✅ Согласен"
 BTN_CANCEL_ORDER = "✖ Отменить заказ"
+FINISH_MATERIALS = "Материалы загружены"
+BTN_FINISH_MATERIALS = f"✅ {FINISH_MATERIALS}"
 
 MAX_MATERIAL_SIZE_MIB = MAX_MATERIAL_SIZE_BYTES // (1024 * 1024)
 # Сколько символов имени файла показываем в ответах.
@@ -145,6 +154,13 @@ MATERIAL_FAILURE_TEXTS: dict[MaterialFailureReason, str] = {
     ),
 }
 
+MATERIALS_NONE = "Вы ещё не прислали ни одного файла. Пришлите материалы — PDF, DOCX или TXT."
+MATERIALS_NO_TEXT = (
+    "Ни из одного файла не удалось извлечь текст. Пришлите материалы с текстом: "
+    "DOCX, TXT или PDF, сохранённый из текстового редактора."
+)
+MATERIALS_NEXT_STEP = "Следующий шаг — анализ материалов. Сообщим, когда он будет готов."
+
 NO_ORDERS = "У вас пока нет заказов."
 
 HELP = (
@@ -206,6 +222,51 @@ def order_cancelled(order: Order) -> str:
 
 def action_outdated(order: Order) -> str:
     return f"Действие уже неактуально: заказ #{order.id} — «{status_label(order.status)}»."
+
+
+def materials_not_ready(error: MaterialsNotReadyError) -> str:
+    """Почему приём материалов нельзя завершить — коротко, для всплывающего окна."""
+    match error.reason:
+        case MaterialsNotReadyReason.NO_MATERIALS:
+            return MATERIALS_NONE
+        case MaterialsNotReadyReason.PENDING:
+            return (
+                f"⏳ Ещё обрабатываются файлы: {error.pending}. Дождитесь сообщений о "
+                f"результате и нажмите «{FINISH_MATERIALS}» снова."
+            )
+        case _:
+            return MATERIALS_NO_TEXT
+
+
+def materials_already_finished(order: Order) -> str:
+    return f"Материалы по заказу #{order.id} уже приняты."
+
+
+def materials_completed(completion: MaterialsCompletion) -> str:
+    """Итог завершения приёма: счётчики и необработанные файлы, без технических деталей."""
+    state = MaterialCompletionState
+    lines = [
+        f"📥 Материалы по заказу #{completion.order.id} приняты.",
+        f"Файлов: {len(completion.materials)} · "
+        f"текст извлечён: {completion.count(state.WITH_TEXT)} · "
+        f"без текста: {completion.count(state.WITHOUT_TEXT)} · "
+        f"с ошибкой: {completion.count(state.FAILED)}",
+    ]
+    unprocessed = [m for m in completion.materials if m.state is not state.WITH_TEXT]
+    if unprocessed:
+        lines += ["", "Не обработаны:"]
+        for material in unprocessed:
+            if material.state is state.FAILED and material.failure_reason is not None:
+                reason = MATERIAL_FAILURE_TEXTS.get(
+                    material.failure_reason, MATERIAL_PROCESSING_FAILED
+                )
+            elif material.state is state.FAILED:
+                reason = MATERIAL_PROCESSING_FAILED
+            else:
+                reason = TEXT_NOT_FOUND
+            lines.append(f"• «{file_label(material.original_filename)}» — {reason}")
+    lines += ["", MATERIALS_NEXT_STEP]
+    return "\n".join(lines)
 
 
 def file_label(filename: str | None) -> str:

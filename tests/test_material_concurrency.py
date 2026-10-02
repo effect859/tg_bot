@@ -1,4 +1,4 @@
-"""Гонки за материал между независимыми сессиями PostgreSQL.
+"""Гонки между независимыми сессиями PostgreSQL: за материал и за завершение приёма.
 
 В отличие от остальных тестов БД, здесь каждая сессия — своё соединение и настоящие
 транзакции (фикстура committed_sessionmaker): блокировки строк действуют так же, как
@@ -14,8 +14,14 @@ import pytest
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.db.models import OrderMaterial, OrderMaterialText
+from app.db.models import Order, OrderMaterial, OrderMaterialText
 from app.domain.enums import MaterialProcessingStatus, OrderStatus
+from app.domain.errors import (
+    InvalidStatusTransitionError,
+    MaterialsNotAcceptedError,
+    MaterialsNotReadyError,
+    MaterialsNotReadyReason,
+)
 from app.extraction.base import Extraction, ExtractionResult
 from app.services import order_materials as materials
 from app.services import orders
@@ -230,3 +236,149 @@ async def test_old_attempt_loses_to_recovered_attempt(
     assert outcome.kind is OutcomeKind.DISCARDED
     status, attempts, texts = await _state(committed_sessionmaker, material_id)
     assert (status, attempts, texts) == (M.PROCESSED, 2, ["новый"])
+
+
+# --- Завершение приёма материалов -----------------------------------------------------
+
+
+async def _order_with_text(
+    sessionmaker: Sessionmaker, storage: LocalFileStorage, tg_id: int
+) -> int:
+    """Заказ в WAITING_FOR_FILES с одним обработанным материалом с текстом (зафиксировано)."""
+    async with sessionmaker() as session:
+        user = await register_or_update_user(
+            session, tg_id=tg_id, username=None, first_name=None, language_code=None
+        )
+        order = await orders.create_order(session, user_id=user.id)
+        for status in (S.WAITING_FOR_CONSENT, S.WAITING_FOR_FILES):
+            order = await orders.change_status(session, order.id, status)
+        material = await materials.store_material(
+            session, storage, order.id, filename="task.txt", mime_type=None, data=TXT_BYTES
+        )
+        await materials.mark_processing(session, material.id)
+        await materials.mark_processed(session, material.id)
+        session.add(
+            OrderMaterialText(material_id=material.id, text="текст", char_count=5, extractor="t")
+        )
+        order_id = order.id
+        await session.commit()
+    return order_id
+
+
+async def _order_state(sessionmaker: Sessionmaker, order_id: int) -> tuple[S, int]:
+    async with sessionmaker() as session:
+        status = await session.scalar(select(Order.status).where(Order.id == order_id))
+        count = await session.scalar(
+            select(func.count())
+            .select_from(OrderMaterial)
+            .where(OrderMaterial.order_id == order_id)
+        )
+        assert status is not None and count is not None
+        return status, count
+
+
+async def test_file_waits_for_finish_and_is_rejected(
+    committed_sessionmaker: Sessionmaker, storage: LocalFileStorage
+) -> None:
+    """Завершение держит блокировку заказа: файл ждёт её и после перехода отклоняется."""
+    order_id = await _order_with_text(committed_sessionmaker, storage, COMMITTED_TG_ID_BASE + 11)
+
+    async with committed_sessionmaker() as finishing, committed_sessionmaker() as uploading:
+        await materials.finish_materials(finishing, order_id)  # блокировка заказа взята
+        upload = asyncio.create_task(
+            materials.store_material(
+                uploading, storage, order_id, filename="late.txt", mime_type=None, data=TXT_BYTES
+            )
+        )
+        await asyncio.sleep(0.5)
+        assert not upload.done()  # ждёт SELECT ... FOR UPDATE заказа
+        await finishing.commit()
+        with pytest.raises(MaterialsNotAcceptedError):
+            await asyncio.wait_for(upload, 10)
+
+    assert await _order_state(committed_sessionmaker, order_id) == (S.ANALYZING_MATERIALS, 1)
+    # Файл отклонённого материала не остаётся в хранилище.
+    assert not await storage.exists(materials.material_storage_key(order_id, 2, "txt"))
+
+
+async def test_finish_waits_for_new_file_and_refuses(
+    committed_sessionmaker: Sessionmaker, storage: LocalFileStorage
+) -> None:
+    """Файл добавляется под блокировкой заказа: завершение ждёт и видит новый материал."""
+    order_id = await _order_with_text(committed_sessionmaker, storage, COMMITTED_TG_ID_BASE + 12)
+
+    async with committed_sessionmaker() as uploading, committed_sessionmaker() as finishing:
+        await materials.store_material(
+            uploading, storage, order_id, filename="new.txt", mime_type=None, data=TXT_BYTES
+        )  # блокировка заказа взята
+        finish = asyncio.create_task(materials.finish_materials(finishing, order_id))
+        await asyncio.sleep(0.5)
+        assert not finish.done()  # ждёт SELECT ... FOR UPDATE заказа
+        await uploading.commit()
+        with pytest.raises(MaterialsNotReadyError) as caught:
+            await asyncio.wait_for(finish, 10)
+
+    assert (caught.value.reason, caught.value.pending) == (MaterialsNotReadyReason.PENDING, 1)
+    assert await _order_state(committed_sessionmaker, order_id) == (S.WAITING_FOR_FILES, 2)
+
+
+async def test_finish_during_processing_is_refused(
+    committed_sessionmaker: Sessionmaker, storage: LocalFileStorage
+) -> None:
+    """Пока материал обрабатывается, завершение отказывает; материал обрабатывается."""
+    order_id = await _order_with_text(committed_sessionmaker, storage, COMMITTED_TG_ID_BASE + 13)
+    async with committed_sessionmaker() as session:
+        material = await materials.store_material(
+            session, storage, order_id, filename="new.txt", mime_type=None, data=TXT_BYTES
+        )
+        material_id = material.id
+        await session.commit()
+    extractor = SlowExtractor(delay=0.5)
+    started = asyncio.Event()
+
+    async def mark_started() -> None:
+        started.set()
+
+    extractor.on_extract = mark_started
+
+    async def processing() -> ProcessingOutcome:
+        async with committed_sessionmaker() as session:
+            return await process_material(session, storage, extractor, material_id)
+
+    task = asyncio.create_task(processing())
+    await asyncio.wait_for(started.wait(), 10)  # материал захвачен, идёт извлечение
+    async with committed_sessionmaker() as finishing:
+        with pytest.raises(MaterialsNotReadyError) as caught:
+            await materials.finish_materials(finishing, order_id)
+        await finishing.rollback()
+    outcome = await asyncio.wait_for(task, 10)
+
+    assert caught.value.reason is MaterialsNotReadyReason.PENDING
+    assert outcome.kind is OutcomeKind.PROCESSED
+    assert await _order_state(committed_sessionmaker, order_id) == (S.WAITING_FOR_FILES, 2)
+    status, attempts, texts = await _state(committed_sessionmaker, material_id)
+    assert (status, attempts, len(texts)) == (M.PROCESSED, 1, 1)
+
+
+async def test_double_finish_in_two_sessions_moves_order_once(
+    committed_sessionmaker: Sessionmaker, storage: LocalFileStorage
+) -> None:
+    order_id = await _order_with_text(committed_sessionmaker, storage, COMMITTED_TG_ID_BASE + 14)
+    barrier = asyncio.Barrier(2)
+
+    async def finish() -> str:
+        async with committed_sessionmaker() as session:
+            await asyncio.wait_for(barrier.wait(), 10)
+            try:
+                await materials.finish_materials(session, order_id)
+            except InvalidStatusTransitionError:
+                await session.rollback()
+                return "refused"
+            await asyncio.sleep(0.3)  # держим блокировку: второй точно ждёт её
+            await session.commit()
+            return "finished"
+
+    results = await asyncio.gather(finish(), finish())
+
+    assert sorted(results) == ["finished", "refused"]
+    assert await _order_state(committed_sessionmaker, order_id) == (S.ANALYZING_MATERIALS, 1)

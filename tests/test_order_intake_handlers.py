@@ -7,15 +7,16 @@ Message, CallbackQuery и Bot — моки: проверяется наша ло
 
 import logging
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 from unittest.mock import AsyncMock
 
 import pytest
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.methods import GetFile
-from aiogram.types import Document, File, InlineKeyboardMarkup
+from aiogram.methods import EditMessageReplyMarkup, GetFile
+from aiogram.types import Chat, Document, File, InlineKeyboardMarkup, Message
 from aiogram.types import User as TgUser
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
@@ -25,14 +26,15 @@ from app.bot import texts
 from app.bot.handlers import order_intake
 from app.bot.handlers.order_intake import (
     cancel_order,
+    finish_order_materials,
     give_consent,
     new_report,
     receive_document,
 )
 from app.bot.keyboards import OrderAction, OrderCallback
-from app.bot.setup import create_dispatcher
-from app.db.models import Order, OrderMaterial, User
-from app.domain.enums import OrderStatus
+from app.bot.setup import create_dispatcher, notify_material_outcome
+from app.db.models import Order, OrderMaterial, OrderMaterialText, User
+from app.domain.enums import MaterialFailureReason, OrderStatus
 from app.domain.errors import (
     ConsentNotGivenError,
     MaterialLimitError,
@@ -43,8 +45,10 @@ from app.domain.errors import (
     UnsupportedMaterialError,
 )
 from app.domain.materials import MAX_MATERIAL_SIZE_BYTES, MAX_MATERIALS_PER_ORDER
+from app.extraction.base import ExtractionResult
 from app.services import order_materials as materials
 from app.services import orders
+from app.services.material_processing import OutcomeKind, ProcessingOutcome
 from app.services.storage.local import LocalFileStorage
 from app.services.users import register_or_update_user
 from material_samples import DOCX_BYTES, DOCX_MIME, PDF_BYTES, PNG_BYTES, TXT_BYTES, make_zip
@@ -766,3 +770,302 @@ def test_dispatcher_provides_file_storage(
 
     assert dispatcher["file_storage"] is file_storage
     assert order_intake.router in dispatcher.sub_routers
+
+
+# --- Завершение приёма материалов -----------------------------------------------------
+
+
+def _finish_data(order_id: int) -> OrderCallback:
+    return OrderCallback(action=OrderAction.FINISH_MATERIALS, order_id=order_id)
+
+
+def _actions(markup: InlineKeyboardMarkup) -> list[OrderAction]:
+    return [
+        OrderCallback.unpack(b.callback_data).action for row in markup.inline_keyboard for b in row
+    ]
+
+
+async def _material(
+    session: AsyncSession,
+    order_id: int,
+    filename: str,
+    *,
+    text: str | None = "Задание на практику",
+    failure: MaterialFailureReason | None = None,
+) -> None:
+    """Материал в окончательном состоянии: с текстом, без текста или с ошибкой."""
+    material = await materials.add_material(
+        session, order_id, filename=filename, mime_type=None, size_bytes=10
+    )
+    await materials.mark_processing(session, material.id)
+    if failure is not None:
+        await materials.mark_failed(session, material.id, "test failure", reason=failure)
+        return
+    await materials.mark_processed(session, material.id)
+    if text is not None:
+        session.add(
+            OrderMaterialText(
+                material_id=material.id, text=text, char_count=len(text), extractor="test"
+            )
+        )
+        await session.flush()
+
+
+async def _order_status(session: AsyncSession, order_id: int) -> OrderStatus:
+    order = await session.get(Order, order_id, populate_existing=True)
+    assert order is not None
+    return order.status
+
+
+class _CallLog:
+    """Порядок обращений к БД и к Telegram в хендлере."""
+
+    def __init__(self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.calls: list[str] = []
+        for name in ("commit", "rollback"):
+            original = getattr(session, name)
+            monkeypatch.setattr(session, name, self._wrap(name, original))
+
+    def _wrap(self, name: str, original: Callable[[], Any]) -> Callable[[], Any]:
+        async def wrapper() -> None:
+            self.calls.append(name)
+            await original()
+
+        return wrapper
+
+    def telegram(self, mock: AsyncMock, name: str) -> None:
+        mock.side_effect = lambda *args, **kwargs: self.calls.append(name)
+
+
+async def test_finish_materials_moves_order_to_analysis(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    order_id, chat_id = order.id, user.tg_id
+    await _material(session, order_id, "task.pdf")
+    await _material(session, order_id, "<b>scan</b>.pdf", text="")
+    await _material(session, order_id, "locked.pdf", failure=MaterialFailureReason.ENCRYPTED)
+    await session.commit()
+    callback, bot = _callback(), AsyncMock()
+    log = _CallLog(session, monkeypatch)
+    log.telegram(callback.answer, "answer")
+    log.telegram(bot.send_message, "send")
+
+    await finish_order_materials(callback, _finish_data(order_id), session, user, bot)
+
+    assert await _order_status(session, order_id) is S.ANALYZING_MATERIALS
+    # Переход зафиксирован до любых обращений к Telegram.
+    assert log.calls == ["commit", "answer", "send"]
+    callback.answer.assert_awaited_once_with()
+    chat, text = bot.send_message.await_args.args
+    assert chat == chat_id
+    assert f"Материалы по заказу #{order_id} приняты." in text
+    assert "Файлов: 3 · текст извлечён: 1 · без текста: 1 · с ошибкой: 1" in text
+    assert f"«&lt;b&gt;scan&lt;/b&gt;.pdf» — {texts.TEXT_NOT_FOUND}" in text
+    locked_reason = texts.MATERIAL_FAILURE_TEXTS[MaterialFailureReason.ENCRYPTED]
+    assert f"«locked.pdf» — {locked_reason}" in text
+    assert text.endswith("Следующий шаг — анализ материалов. Сообщим, когда он будет готов.")
+    assert "encrypted" not in text and "test failure" not in text
+    # Сообщение недоступно (callback.message is None): снимать кнопки не с чего.
+    bot.edit_message_reply_markup.assert_not_awaited()
+
+
+def _pressed_message() -> Message:
+    return Message(
+        message_id=77,
+        date=datetime(2026, 10, 1, tzinfo=UTC),
+        chat=Chat(id=1, type="private"),
+    )
+
+
+async def test_finish_materials_removes_keyboard(session: AsyncSession) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    await _material(session, order.id, "task.pdf")
+    await session.commit()
+    callback, bot = _callback(), AsyncMock()
+    callback.message = _pressed_message()
+
+    await finish_order_materials(callback, _finish_data(order.id), session, user, bot)
+
+    bot.edit_message_reply_markup.assert_awaited_once_with(
+        chat_id=1, message_id=77, reply_markup=None
+    )
+    bot.send_message.assert_awaited_once()
+
+
+async def test_keyboard_removal_failure_keeps_transition(session: AsyncSession) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    order_id = order.id
+    await _material(session, order_id, "task.pdf")
+    await session.commit()
+    callback, bot = _callback(), AsyncMock()
+    callback.message = _pressed_message()
+    bot.edit_message_reply_markup.side_effect = TelegramBadRequest(
+        method=EditMessageReplyMarkup(chat_id=1, message_id=77),
+        message="Bad Request: message is not modified",
+    )
+
+    await finish_order_materials(callback, _finish_data(order_id), session, user, bot)
+
+    assert await _order_status(session, order_id) is S.ANALYZING_MATERIALS
+    bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("setup", "expected"),
+    [
+        ("none", texts.MATERIALS_NONE),
+        ("pending", "⏳ Ещё обрабатываются файлы: 1."),
+        ("no_text", texts.MATERIALS_NO_TEXT),
+    ],
+)
+async def test_materials_not_ready_is_refused_with_rollback_first(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch, setup: str, expected: str
+) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    order_id = order.id
+    if setup == "pending":
+        await _material(session, order_id, "task.pdf")
+        await materials.add_material(
+            session, order_id, filename="new.pdf", mime_type=None, size_bytes=10
+        )
+    elif setup == "no_text":
+        await _material(session, order_id, "bad.pdf", failure=MaterialFailureReason.CORRUPTED)
+    await session.commit()
+    callback, bot = _callback(), AsyncMock()
+    log = _CallLog(session, monkeypatch)
+    log.telegram(callback.answer, "answer")
+
+    await finish_order_materials(callback, _finish_data(order_id), session, user, bot)
+
+    assert log.calls == ["rollback", "answer"]
+    text = callback.answer.await_args.args[0]
+    assert text.startswith(expected)
+    assert callback.answer.await_args.kwargs == {"show_alert": True}
+    assert await _order_status(session, order_id) is S.WAITING_FOR_FILES
+    bot.send_message.assert_not_awaited()
+
+
+async def test_repeated_finish_is_reported_as_already_done(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    order_id = order.id
+    await _material(session, order_id, "task.pdf")
+    await session.commit()
+    await finish_order_materials(_callback(), _finish_data(order_id), session, user, AsyncMock())
+    callback, bot = _callback(), AsyncMock()
+    log = _CallLog(session, monkeypatch)
+    log.telegram(callback.answer, "answer")
+
+    await finish_order_materials(callback, _finish_data(order_id), session, user, bot)
+
+    assert log.calls == ["rollback", "answer"]
+    assert callback.answer.await_args.args[0] == f"Материалы по заказу #{order_id} уже приняты."
+    assert await _order_status(session, order_id) is S.ANALYZING_MATERIALS
+    bot.send_message.assert_not_awaited()
+
+
+async def test_finish_button_of_cancelled_order_is_outdated(session: AsyncSession) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    order_id = order.id
+    await _material(session, order_id, "task.pdf")
+    order = await orders.change_status(session, order_id, S.CANCELLED)
+    expected = texts.action_outdated(order)
+    await session.commit()
+    callback = _callback()
+
+    await finish_order_materials(callback, _finish_data(order_id), session, user, AsyncMock())
+
+    assert callback.answer.await_args.args[0] == expected
+    assert await _order_status(session, order_id) is S.CANCELLED
+
+
+async def test_finish_button_of_foreign_order_does_nothing(session: AsyncSession) -> None:
+    owner = await _user(session, tg_id=1)
+    stranger = await _user(session, tg_id=2)
+    order = await _order(session, owner)
+    order_id = order.id
+    await _material(session, order_id, "task.pdf")
+    await session.commit()
+    callback, bot = _callback(tg_id=2), AsyncMock()
+
+    await finish_order_materials(callback, _finish_data(order_id), session, stranger, bot)
+
+    callback.answer.assert_awaited_once_with(texts.ORDER_NOT_FOUND, show_alert=True)
+    assert await _order_status(session, order_id) is S.WAITING_FOR_FILES
+    bot.send_message.assert_not_awaited()
+
+
+async def test_accepted_file_reply_has_finish_button(
+    session: AsyncSession, file_storage: LocalFileStorage
+) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    message = _message("task.pdf", "application/pdf", len(PDF_BYTES))
+
+    await _receive(session, user, _bot(PDF_BYTES), file_storage, message)
+
+    markup = message.answer.await_args.kwargs["reply_markup"]
+    assert _actions(markup) == [OrderAction.FINISH_MATERIALS, OrderAction.CANCEL]
+    assert OrderCallback.unpack(markup.inline_keyboard[0][0].callback_data).order_id == order.id
+
+
+async def test_reminder_has_finish_button(session: AsyncSession) -> None:
+    user = await _user(session)
+    await _order(session, user)
+    message = AsyncMock()
+
+    await new_report(message, session, user)
+
+    markup = message.answer.await_args.kwargs["reply_markup"]
+    assert _actions(markup) == [OrderAction.FINISH_MATERIALS, OrderAction.CANCEL]
+
+
+async def test_files_request_after_consent_has_only_cancel(session: AsyncSession) -> None:
+    user = await _user(session)
+    order = await _order(session, user, consent=False)
+    bot = AsyncMock()
+    data = OrderCallback(action=OrderAction.CONSENT, order_id=order.id)
+
+    await give_consent(_callback(), data, session, user, bot)
+
+    assert _actions(bot.send_message.await_args.kwargs["reply_markup"]) == [OrderAction.CANCEL]
+
+
+async def test_background_notification_has_no_buttons() -> None:
+    bot = AsyncMock()
+    outcome = ProcessingOutcome(
+        kind=OutcomeKind.PROCESSED,
+        material_id=1,
+        upload_order=1,
+        original_filename="task.pdf",
+        result=ExtractionResult(text="t", extractor="x"),
+    )
+
+    await notify_material_outcome(bot, 1, outcome)
+
+    assert bot.send_message.await_args.kwargs == {}
+
+
+async def test_file_after_finish_is_rejected(
+    session: AsyncSession, file_storage: LocalFileStorage
+) -> None:
+    user = await _user(session)
+    order = await _order(session, user)
+    await _material(session, order.id, "task.pdf")
+    await materials.finish_materials(session, order.id)
+    message = _message("late.pdf", "application/pdf", len(PDF_BYTES))
+
+    reply = await _receive(session, user, _bot(PDF_BYTES), file_storage, message)
+
+    assert reply == texts.material_failed(
+        "late.pdf", "сейчас файлы не принимаются: заказ на шаге «анализ материалов»."
+    )
+    assert len(await _materials(session, order.id)) == 1

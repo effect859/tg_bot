@@ -14,6 +14,7 @@ from app.bot import texts
 class OrderAction(StrEnum):
     CONSENT = "consent"
     CANCEL = "cancel"
+    FINISH_MATERIALS = "finish"
 
 
 class OrderCallback(CallbackData, prefix="order"):
@@ -52,4 +53,14 @@ def consent_keyboard(order_id: int) -> InlineKeyboardMarkup:
 def cancel_order_keyboard(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[_order_button(texts.BTN_CANCEL_ORDER, OrderAction.CANCEL, order_id)]]
+    )
+
+
+def materials_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    """Шаг загрузки, когда файлы уже есть: завершить приём или отменить заказ."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_order_button(texts.BTN_FINISH_MATERIALS, OrderAction.FINISH_MATERIALS, order_id)],
+            [_order_button(texts.BTN_CANCEL_ORDER, OrderAction.CANCEL, order_id)],
+        ]
     )

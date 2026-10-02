@@ -1,27 +1,39 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Order, OrderMaterial
-from app.domain.enums import MaterialProcessingStatus, OrderStatus
+from app.db.models import Order, OrderMaterial, OrderMaterialText
+from app.domain.enums import MaterialFailureReason, MaterialProcessingStatus, OrderStatus
 from app.domain.errors import (
     ConsentNotGivenError,
     InvalidMaterialTransitionError,
+    InvalidStatusTransitionError,
     MaterialLimitError,
     MaterialNotFoundError,
     MaterialsLockedError,
     MaterialsNotAcceptedError,
+    MaterialsNotReadyError,
+    MaterialsNotReadyReason,
     OrderNotFoundError,
     UnsupportedMaterialError,
 )
-from app.domain.materials import MAX_MATERIALS_PER_ORDER
+from app.domain.materials import (
+    MAX_MATERIALS_PER_ORDER,
+    MAX_PROCESSING_ATTEMPTS,
+    MaterialCompletionState,
+)
 from app.services import order_materials as materials
 from app.services import orders
+from app.services.material_processing import find_recoverable_materials
 from app.services.users import register_or_update_user
 
 S = OrderStatus
 M = MaterialProcessingStatus
+R = MaterialFailureReason
+C = MaterialCompletionState
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 FILES = [
     ("requirements.pdf", "application/pdf"),
@@ -411,3 +423,222 @@ async def test_deleting_order_removes_its_materials(session: AsyncSession) -> No
     await session.execute(text("DELETE FROM orders WHERE id = :id"), {"id": order.id})
 
     assert await _material_count(session) == 0
+
+
+# --- Завершение приёма материалов --------------------------------------------------------
+
+
+async def _processed(session: AsyncSession, material: OrderMaterial, text: str | None) -> None:
+    """Обработанный материал; ``text=None`` — без строки в order_material_texts."""
+    await materials.mark_processing(session, material.id)
+    await materials.mark_processed(session, material.id)
+    if text is not None:
+        session.add(
+            OrderMaterialText(
+                material_id=material.id, text=text, char_count=len(text), extractor="test"
+            )
+        )
+        await session.flush()
+
+
+async def _failed(
+    session: AsyncSession, material: OrderMaterial, reason: R, attempts: int = 1
+) -> None:
+    await materials.mark_processing(session, material.id)
+    await materials.mark_failed(session, material.id, "test failure", reason=reason)
+    await session.execute(
+        update(OrderMaterial)
+        .where(OrderMaterial.id == material.id)
+        .values(processing_attempts=attempts)
+    )
+
+
+async def _status(session: AsyncSession, order_id: int) -> OrderStatus:
+    order = await session.get(Order, order_id, populate_existing=True)
+    assert order is not None
+    return order.status
+
+
+async def _not_ready(session: AsyncSession, order_id: int) -> MaterialsNotReadyError:
+    with pytest.raises(MaterialsNotReadyError) as caught:
+        await materials.finish_materials(session, order_id)
+    assert await _status(session, order_id) is S.WAITING_FOR_FILES
+    return caught.value
+
+
+async def test_finish_materials_moves_order_to_analysis(session: AsyncSession) -> None:
+    order = await _order(session)
+    task = await _add(session, order.id, "task.pdf")
+    scan = await _add(session, order.id, "scan.pdf")
+    locked = await _add(session, order.id, "locked.pdf")
+    await _processed(session, task, "Задание на практику")
+    await _processed(session, scan, "")
+    await _failed(session, locked, R.ENCRYPTED)
+
+    completion = await materials.finish_materials(session, order.id)
+
+    assert completion.order.status is S.ANALYZING_MATERIALS
+    assert await _status(session, order.id) is S.ANALYZING_MATERIALS
+    assert completion.materials == [
+        materials.MaterialSummary(1, "task.pdf", C.WITH_TEXT),
+        materials.MaterialSummary(2, "scan.pdf", C.WITHOUT_TEXT),
+        materials.MaterialSummary(3, "locked.pdf", C.FAILED, R.ENCRYPTED),
+    ]
+    assert [completion.count(state) for state in (C.WITH_TEXT, C.WITHOUT_TEXT, C.FAILED)] == [
+        1,
+        1,
+        1,
+    ]
+
+
+async def test_finish_materials_without_materials(session: AsyncSession) -> None:
+    order = await _order(session)
+
+    error = await _not_ready(session, order.id)
+
+    assert error.reason is MaterialsNotReadyReason.NO_MATERIALS
+
+
+async def test_finish_materials_with_pending_materials(session: AsyncSession) -> None:
+    order = await _order(session)
+    done = await _add(session, order.id)
+    await _processed(session, done, "текст")
+    await _add(session, order.id)  # RECEIVED
+    in_work = await _add(session, order.id)
+    await materials.mark_processing(session, in_work.id)
+    retrying = await _add(session, order.id)
+    await _failed(session, retrying, R.STORAGE_ERROR, attempts=1)
+
+    error = await _not_ready(session, order.id)
+
+    assert (error.reason, error.pending) == (MaterialsNotReadyReason.PENDING, 3)
+
+
+async def test_exhausted_retryable_failure_does_not_block(session: AsyncSession) -> None:
+    order = await _order(session)
+    done = await _add(session, order.id)
+    await _processed(session, done, "текст")
+    exhausted = await _add(session, order.id)
+    await _failed(session, exhausted, R.STORAGE_ERROR, attempts=MAX_PROCESSING_ATTEMPTS)
+
+    completion = await materials.finish_materials(session, order.id)
+
+    assert completion.count(C.FAILED) == 1
+
+
+async def test_finish_materials_when_all_failed(session: AsyncSession) -> None:
+    order = await _order(session)
+    for reason in (R.CORRUPTED, R.TIMEOUT):
+        await _failed(session, await _add(session, order.id), reason)
+
+    error = await _not_ready(session, order.id)
+
+    assert error.reason is MaterialsNotReadyReason.NO_TEXT
+
+
+@pytest.mark.parametrize("text_value", ["", None], ids=["empty-text", "no-text-row"])
+async def test_processed_without_text_is_not_enough(
+    session: AsyncSession, text_value: str | None
+) -> None:
+    order = await _order(session)
+    await _processed(session, await _add(session, order.id), text_value)
+
+    error = await _not_ready(session, order.id)
+
+    assert error.reason is MaterialsNotReadyReason.NO_TEXT
+
+
+async def test_refusal_changes_nothing(session: AsyncSession) -> None:
+    order = await _order(session)
+    done = await _add(session, order.id)
+    await _processed(session, done, "текст")
+    await _add(session, order.id)
+    before = _snapshot(await materials.get_order_materials(session, order.id))
+
+    await _not_ready(session, order.id)
+
+    assert _snapshot(await materials.get_order_materials(session, order.id)) == before
+
+
+@pytest.mark.parametrize(
+    "status", [S.WAITING_FOR_CONSENT, S.CANCELLED, S.WAITING_FOR_MISSING_DATA, S.FAILED]
+)
+async def test_finish_materials_in_wrong_status(session: AsyncSession, status: S) -> None:
+    if status in (S.WAITING_FOR_MISSING_DATA, S.FAILED):
+        # Приём уже завершён, материалы готовы: карта переходов вела бы обратно в анализ
+        # (повторный анализ, возврат из сбоя анализа), но старая кнопка не должна.
+        order = await _order(session)
+        await _processed(session, await _add(session, order.id), "текст")
+        await materials.finish_materials(session, order.id)
+        order = await orders.change_status(session, order.id, status)
+        if status is S.FAILED:
+            assert order.failed_from_status is S.ANALYZING_MATERIALS
+    else:
+        order = await _order(session, consent=False)
+        order = await orders.change_status(session, order.id, S.WAITING_FOR_CONSENT)
+        if status is S.CANCELLED:
+            await orders.change_status(session, order.id, S.CANCELLED)
+
+    with pytest.raises(InvalidStatusTransitionError):
+        await materials.finish_materials(session, order.id)
+    assert await _status(session, order.id) is status
+    if status is S.FAILED:
+        assert order.failed_from_status is S.ANALYZING_MATERIALS
+
+
+async def test_finish_materials_twice(session: AsyncSession) -> None:
+    order = await _order(session)
+    await _processed(session, await _add(session, order.id), "текст")
+    await materials.finish_materials(session, order.id)
+
+    with pytest.raises(InvalidStatusTransitionError):
+        await materials.finish_materials(session, order.id)
+    assert await _status(session, order.id) is S.ANALYZING_MATERIALS
+
+
+async def test_finish_materials_unknown_order(session: AsyncSession) -> None:
+    with pytest.raises(OrderNotFoundError):
+        await materials.finish_materials(session, 999_999)
+
+
+async def test_no_files_after_materials_finished(session: AsyncSession) -> None:
+    order = await _order(session)
+    await _processed(session, await _add(session, order.id), "текст")
+    await materials.finish_materials(session, order.id)
+
+    with pytest.raises(MaterialsNotAcceptedError):
+        await materials.ensure_can_add_material(
+            session, order.id, filename="late.pdf", mime_type=None, size_bytes=10
+        )
+    with pytest.raises(MaterialsNotAcceptedError):
+        await _add(session, order.id, "late.pdf")
+    assert await _material_count(session) == 1
+
+
+async def test_recovery_sees_pending_materials_until_finished(session: AsyncSession) -> None:
+    """Незавершённые материалы остаются в зоне восстановления, пока приём не завершён."""
+    order = await _order(session)
+    await _processed(session, await _add(session, order.id), "текст")
+    stale = await _add(session, order.id)
+    await materials.mark_processing(session, stale.id)
+    await session.execute(
+        update(OrderMaterial)
+        .where(OrderMaterial.id == stale.id)
+        .values(processing_started_at=datetime.now(UTC) - timedelta(minutes=10))
+    )
+    retrying = await _add(session, order.id)
+    await _failed(session, retrying, R.STORAGE_ERROR, attempts=1)
+
+    await _not_ready(session, order.id)
+    assert set(await find_recoverable_materials(session, limit=10)) == {stale.id, retrying.id}
+
+    # Обработка закончилась: один сбой окончательный, другой исчерпал попытки.
+    await materials.mark_failed(session, stale.id, "interrupted", reason=R.INTERRUPTED)
+    await session.execute(
+        update(OrderMaterial)
+        .where(OrderMaterial.id.in_([stale.id, retrying.id]))
+        .values(processing_attempts=MAX_PROCESSING_ATTEMPTS)
+    )
+    await materials.finish_materials(session, order.id)
+
+    assert await find_recoverable_materials(session, limit=10) == []
