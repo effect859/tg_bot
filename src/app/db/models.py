@@ -37,7 +37,7 @@ from app.domain.enums import (
     TransactionReason,
     VersionStatus,
 )
-from app.domain.order_flow import INACTIVE_ORDER_STATUSES
+from app.domain.order_flow import FAILABLE_STATUSES, INACTIVE_ORDER_STATUSES
 
 
 def _pg_enum(enum_cls: type[StrEnum], name: str) -> Enum:
@@ -77,6 +77,12 @@ def _active_order_predicate() -> str:
     return f"status NOT IN ({inactive})"
 
 
+def _step_running_predicate() -> str:
+    # Список продублирован в миграции 0006: при изменении FAILABLE_STATUSES нужна миграция.
+    steps = ", ".join(f"'{status.value}'" for status in sorted(FAILABLE_STATUSES))
+    return f"step_started_at IS NULL OR status IN ({steps})"
+
+
 class Order(TimestampMixin, Base):
     __tablename__ = "orders"
     __table_args__ = (
@@ -92,6 +98,8 @@ class Order(TimestampMixin, Base):
             "(status = 'failed') = (failed_from_status IS NOT NULL)",
             name="failed_from_status_consistent",
         ),
+        CheckConstraint("step_attempts >= 0", name="step_attempts_non_negative"),
+        CheckConstraint(_step_running_predicate(), name="step_started_at_consistent"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -112,6 +120,11 @@ class Order(TimestampMixin, Base):
     consent_given_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Автоматический шаг (анализ материалов, позже план и генерация): сколько раз его
+    # брали в работу с момента входа в шаг и когда началась текущая попытка (NULL —
+    # попытка не идёт). Сбрасываются при смене статуса — см. services.orders.change_status.
+    step_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    step_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class _OrderVersionMixin(TimestampMixin):

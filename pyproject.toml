@@ -16,6 +16,8 @@ dependencies = [
     # них; обновление — с повторным прогоном тестов извлечения в Linux-контейнере.
     "pypdfium2==5.13.0",
     "lxml==6.1.3",
+    # Официальный SDK Anthropic: анализ материалов (структурированный ответ).
+    "anthropic>=1.11,<2",
 ]
 
 [project.optional-dependencies]

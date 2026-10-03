@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from functools import partial
 
 from aiogram import Bot, Dispatcher
@@ -9,8 +10,11 @@ from app.bot.handlers import menu, order_intake, start
 from app.bot.middlewares.db import DbSessionMiddleware
 from app.bot.middlewares.user import UserMiddleware
 from app.extraction.base import TextExtractor
+from app.llm.base import LLMClient
 from app.services.material_processing import ProcessingOutcome
 from app.services.material_recovery import MaterialRecovery
+from app.services.periodic import PeriodicPass
+from app.services.requirements_analysis import AnalysisOutcome, AnalysisRecovery
 from app.services.storage.base import FileStorage
 
 
@@ -19,12 +23,15 @@ def create_dispatcher(
     storage: BaseStorage,
     file_storage: FileStorage,
     text_extractor: TextExtractor | None = None,
+    llm_client: LLMClient | None = None,
 ) -> Dispatcher:
     dispatcher = Dispatcher(storage=storage)
-    # Доступны хендлерам как аргументы file_storage и text_extractor.
+    # Доступны хендлерам как аргументы file_storage, text_extractor и llm_client.
     dispatcher["file_storage"] = file_storage
     # Без извлекателя файлы только принимаются (так работают тесты приёма Stage 2.3).
     dispatcher["text_extractor"] = text_extractor
+    # Без LLM-клиента заказ после завершения приёма остаётся ждать анализа (тесты 2.6).
+    dispatcher["llm_client"] = llm_client
 
     # Порядок важен: UserMiddleware использует сессию из DbSessionMiddleware.
     dispatcher.update.outer_middleware(DbSessionMiddleware(sessionmaker))
@@ -32,29 +39,34 @@ def create_dispatcher(
 
     dispatcher.include_routers(start.router, menu.router, order_intake.router)
     if text_extractor is not None:
-        _setup_material_recovery(dispatcher, sessionmaker, file_storage, text_extractor)
+        _run_while_polling(
+            dispatcher,
+            lambda bot: MaterialRecovery(
+                sessionmaker, file_storage, text_extractor, partial(notify_material_outcome, bot)
+            ),
+        )
+    if llm_client is not None:
+        _run_while_polling(
+            dispatcher,
+            lambda bot: AnalysisRecovery(
+                sessionmaker, llm_client, partial(notify_analysis_outcome, bot)
+            ),
+        )
     return dispatcher
 
 
-def _setup_material_recovery(
-    dispatcher: Dispatcher,
-    sessionmaker: async_sessionmaker[AsyncSession],
-    file_storage: FileStorage,
-    text_extractor: TextExtractor,
-) -> None:
-    """Восстановление обработки материалов работает, пока работает polling.
+def _run_while_polling(dispatcher: Dispatcher, create: Callable[[Bot], PeriodicPass]) -> None:
+    """Фоновый проход работает, пока работает polling.
 
     Запускается в startup (Bot известен только там), останавливается в shutdown — до
     закрытия сессии бота и пула БД в main_bot.
     """
-    started: list[MaterialRecovery] = []
+    started: list[PeriodicPass] = []
 
     async def on_startup(bot: Bot) -> None:
-        recovery = MaterialRecovery(
-            sessionmaker, file_storage, text_extractor, partial(notify_material_outcome, bot)
-        )
-        recovery.start()
-        started.append(recovery)
+        periodic = create(bot)
+        periodic.start()
+        started.append(periodic)
 
     async def on_shutdown() -> None:
         while started:
@@ -69,3 +81,11 @@ async def notify_material_outcome(bot: Bot, chat_id: int, outcome: ProcessingOut
     text = texts.material_processing_result(outcome)
     if text is not None:
         await bot.send_message(chat_id, text)
+
+
+async def notify_analysis_outcome(bot: Bot, chat_id: int, outcome: AnalysisOutcome) -> None:
+    """Сообщение пользователю об исходе фонового анализа материалов."""
+    reply = order_intake.analysis_reply(outcome)
+    if reply is not None:
+        text, markup = reply
+        await bot.send_message(chat_id, text, reply_markup=markup)

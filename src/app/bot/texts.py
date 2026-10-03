@@ -1,5 +1,6 @@
 """Тексты бота. Сообщения отправляются с parse_mode=HTML: пользовательские данные экранируем."""
 
+from collections.abc import Sequence
 from html import escape
 
 from app.db.models import Order
@@ -20,9 +21,11 @@ from app.domain.materials import (
     MAX_MATERIALS_PER_ORDER,
     MaterialCompletionState,
 )
+from app.domain.requirements import MAX_ANALYSIS_INPUT_CHARS
 from app.extraction.base import WarningCode
 from app.services.material_processing import OutcomeKind, ProcessingOutcome
 from app.services.order_materials import MaterialsCompletion
+from app.services.requirements_analysis import AnalysisOutcome
 
 BTN_NEW_REPORT = "📝 Новый отчёт по практике"
 BTN_MY_ORDERS = "📂 Мои заказы"
@@ -56,6 +59,8 @@ BTN_CONSENT = "✅ Согласен"
 BTN_CANCEL_ORDER = "✖ Отменить заказ"
 FINISH_MATERIALS = "Материалы загружены"
 BTN_FINISH_MATERIALS = f"✅ {FINISH_MATERIALS}"
+RETRY_ANALYSIS = "Повторить анализ"
+BTN_RETRY_ANALYSIS = f"🔄 {RETRY_ANALYSIS}"
 
 MAX_MATERIAL_SIZE_MIB = MAX_MATERIAL_SIZE_BYTES // (1024 * 1024)
 # Сколько символов имени файла показываем в ответах.
@@ -161,6 +166,29 @@ MATERIALS_NO_TEXT = (
 )
 MATERIALS_NEXT_STEP = "Следующий шаг — анализ материалов. Сообщим, когда он будет готов."
 
+# Поля ТЗ отчёта по практике — как их называть пользователю.
+REQUIREMENT_LABELS: dict[str, str] = {
+    "topic": "тема практики",
+    "practice_type": "вид практики",
+    "practice_place": "место практики",
+    "practice_start": "дата начала практики",
+    "practice_end": "дата окончания практики",
+    "university": "вуз",
+    "specialty": "направление подготовки",
+    "student_name": "ФИО студента",
+    "student_group": "группа",
+    "supervisor": "руководитель практики",
+    "target_pages": "объём отчёта",
+    "extra_requirements": "дополнительные требования",
+}
+ANALYSIS_STARTED = "🔎 Анализирую материалы — это может занять пару минут."
+ANALYSIS_DELAYED = (
+    "⏳ Анализ материалов не завершился с первой попытки. Повторим автоматически "
+    "и сообщим результат."
+)
+ANALYSIS_LIMIT_REACHED = "Лимит попыток анализа исчерпан. Отмените заказ, чтобы оформить новый."
+ANALYSIS_UNAVAILABLE = "Анализ материалов сейчас недоступен. Попробуйте позже."
+
 NO_ORDERS = "У вас пока нет заказов."
 
 HELP = (
@@ -240,6 +268,54 @@ def materials_not_ready(error: MaterialsNotReadyError) -> str:
 
 def materials_already_finished(order: Order) -> str:
     return f"Материалы по заказу #{order.id} уже приняты."
+
+
+def _labels(fields: Sequence[str]) -> str:
+    return ", ".join(REQUIREMENT_LABELS.get(name, name) for name in fields)
+
+
+def analysis_completed(outcome: AnalysisOutcome) -> str:
+    """Итог анализа: что найдено в материалах и чего не хватает — без технических деталей."""
+    lines = [f"📋 Материалы по заказу #{outcome.order_id} проанализированы."]
+    lines.append(
+        f"Найдено в материалах: {_labels(outcome.found)}."
+        if outcome.found
+        else "В материалах не нашлось данных для ТЗ."
+    )
+    if outcome.missing:
+        lines.append(f"Нужно уточнить: {_labels(outcome.missing)}.")
+    if outcome.truncated_material is not None or outcome.omitted_materials:
+        details = []
+        if outcome.truncated_material is not None:
+            details.append(f"файл №{outcome.truncated_material} — частично")
+        if outcome.omitted_materials:
+            numbers = ", ".join(f"№{n}" for n in outcome.omitted_materials)
+            details.append(f"не вошли: {numbers}")
+        limit = f"{MAX_ANALYSIS_INPUT_CHARS:,}".replace(",", " ")
+        lines.append(
+            f"⚠️ Материалы слишком объёмные: учтены первые {limit} символов ({'; '.join(details)})."
+        )
+    lines.append("")
+    if outcome.status is OrderStatus.WAITING_FOR_DATA_CONFIRMATION:
+        lines.append("Следующий шаг — подтверждение ТЗ. Сообщим, когда он будет готов.")
+    else:
+        lines.append("Следующий шаг — уточнение данных. Сообщим, когда он будет готов.")
+    return "\n".join(lines)
+
+
+def analysis_failed(order_id: int, *, can_retry: bool) -> str:
+    text = f"❌ Не удалось проанализировать материалы по заказу #{order_id}."
+    if can_retry:
+        return f"{text} Нажмите «{RETRY_ANALYSIS}» или отмените заказ."
+    return f"{text} {ANALYSIS_LIMIT_REACHED}"
+
+
+def analysis_in_progress(order: Order) -> str:
+    return f"Заказ #{order.id}: идёт анализ материалов. Сообщим, когда он завершится."
+
+
+def analysis_already_restarted(order: Order) -> str:
+    return f"Анализ материалов по заказу #{order.id} уже выполняется."
 
 
 def materials_completed(completion: MaterialsCompletion) -> str:

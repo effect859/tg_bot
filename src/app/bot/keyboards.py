@@ -15,6 +15,7 @@ class OrderAction(StrEnum):
     CONSENT = "consent"
     CANCEL = "cancel"
     FINISH_MATERIALS = "finish"
+    RETRY_ANALYSIS = "retry_analysis"
 
 
 class OrderCallback(CallbackData, prefix="order"):
@@ -54,6 +55,16 @@ def cancel_order_keyboard(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[_order_button(texts.BTN_CANCEL_ORDER, OrderAction.CANCEL, order_id)]]
     )
+
+
+def analysis_failed_keyboard(order_id: int, *, can_retry: bool) -> InlineKeyboardMarkup:
+    """Сбой анализа: повторить (пока не исчерпан лимит) или отменить заказ."""
+    rows = [[_order_button(texts.BTN_CANCEL_ORDER, OrderAction.CANCEL, order_id)]]
+    if can_retry:
+        rows.insert(
+            0, [_order_button(texts.BTN_RETRY_ANALYSIS, OrderAction.RETRY_ANALYSIS, order_id)]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def materials_keyboard(order_id: int) -> InlineKeyboardMarkup:

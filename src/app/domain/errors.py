@@ -131,6 +131,15 @@ class MaterialsNotReadyError(OrderDomainError):
         self.pending = pending
 
 
+class AnalysisLimitReachedError(OrderDomainError):
+    """Исчерпан лимит вызовов модели на анализ материалов заказа."""
+
+    def __init__(self, order_id: int, limit: int) -> None:
+        super().__init__(f"Order {order_id}: analysis LLM call limit of {limit} reached")
+        self.order_id = order_id
+        self.limit = limit
+
+
 class MaterialNotFoundError(OrderDomainError):
     def __init__(self, material_id: int) -> None:
         super().__init__(f"Material {material_id} not found")

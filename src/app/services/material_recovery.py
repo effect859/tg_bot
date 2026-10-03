@@ -29,9 +29,7 @@
 но одновременно может работать по процессу на экземпляр.
 """
 
-import asyncio
 import logging
-from collections import Counter
 from collections.abc import Awaitable, Callable
 
 from sqlalchemy import select
@@ -45,6 +43,7 @@ from app.services.material_processing import (
     find_recoverable_materials,
     process_material,
 )
+from app.services.periodic import PeriodicPass
 from app.services.storage.base import FileStorage
 
 logger = logging.getLogger(__name__)
@@ -87,8 +86,12 @@ async def run_recovery_pass(
     return outcomes
 
 
-class MaterialRecovery:
-    """Периодический проход восстановления; первый — сразу после start()."""
+class MaterialRecovery(PeriodicPass):
+    """Периодический проход восстановления; первый — сразу после start().
+
+    При остановке идущее извлечение снимает runner: дочерний процесс завершается
+    вместе с задачей.
+    """
 
     def __init__(
         self,
@@ -100,57 +103,17 @@ class MaterialRecovery:
         interval_seconds: float = RECOVERY_INTERVAL_SECONDS,
         batch: int = RECOVERY_BATCH,
     ) -> None:
+        super().__init__(name="material-recovery", interval_seconds=interval_seconds)
         self._sessionmaker = sessionmaker
         self._storage = storage
         self._extractor = extractor
         self._notify = notify
-        self._interval = interval_seconds
         self._batch = batch
-        self._task: asyncio.Task[None] | None = None
 
-    @property
-    def running(self) -> bool:
-        return self._task is not None and not self._task.done()
-
-    def start(self) -> None:
-        if self._task is not None:
-            raise RuntimeError("Material recovery is already started")
-        self._task = asyncio.create_task(self._run(), name="material-recovery")
-
-    async def stop(self) -> None:
-        """Отменяет проход и дожидается его завершения.
-
-        Идущее извлечение снимает runner: дочерний процесс завершается вместе с задачей.
-        """
-        task, self._task = self._task, None
-        if task is None:
-            return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            # Отменили саму остановку — отмену не проглатываем.
-            current = asyncio.current_task()
-            if current is not None and current.cancelling():
-                raise
-
-    async def _run(self) -> None:
-        while True:
-            try:
-                outcomes = await run_recovery_pass(
-                    self._sessionmaker,
-                    self._storage,
-                    self._extractor,
-                    self._notify,
-                    batch=self._batch,
-                )
-            except Exception:
-                logger.exception("Material recovery pass failed")
-            else:
-                if outcomes:
-                    kinds = Counter(outcome.kind.value for outcome in outcomes)
-                    logger.info("Material recovery pass: %s", dict(kinds))
-            await asyncio.sleep(self._interval)
+    async def run_pass(self) -> list[ProcessingOutcome]:
+        return await run_recovery_pass(
+            self._sessionmaker, self._storage, self._extractor, self._notify, batch=self._batch
+        )
 
 
 def _is_final(outcome: ProcessingOutcome) -> bool:

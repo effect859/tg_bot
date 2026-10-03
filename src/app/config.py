@@ -23,6 +23,25 @@ class Settings(BaseSettings):
     # Экспериментальное значение: подобрано на синтетических файлах.
     extraction_memory_limit_mib: int = 1024
 
+    # LLM (анализ материалов). Ключ необязателен для миграций и тестов, но бот без него
+    # не запускается: см. require_llm_api_key.
+    anthropic_api_key: SecretStr | None = None
+    llm_model: str = "claude-sonnet-5-5"
+
+
+class ConfigurationError(Exception):
+    """Настройки не позволяют запустить приложение."""
+
+
+def require_llm_api_key(settings: Settings) -> str:
+    """Ключ Anthropic для бота. Raises ConfigurationError, если он не задан."""
+    key = settings.anthropic_api_key.get_secret_value() if settings.anthropic_api_key else ""
+    if not key.strip():
+        raise ConfigurationError(
+            "ANTHROPIC_API_KEY is not set: the bot cannot analyze materials without the LLM"
+        )
+    return key.strip()
+
 
 @lru_cache
 def get_settings() -> Settings:

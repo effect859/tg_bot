@@ -1,4 +1,4 @@
-"""Оформление заказа: создание, согласие, приём материалов, завершение приёма, отмена.
+"""Оформление заказа: создание, согласие, приём материалов, завершение приёма, анализ, отмена.
 
 Источник истины о шаге заказа — его статус в БД, FSM-состояния не используются.
 Документ всегда прикрепляется к активному заказу отправителя; order_id из кнопок
@@ -18,6 +18,7 @@ from app.bot import texts
 from app.bot.keyboards import (
     OrderAction,
     OrderCallback,
+    analysis_failed_keyboard,
     cancel_order_keyboard,
     consent_keyboard,
     main_menu_keyboard,
@@ -28,6 +29,7 @@ from app.db.models import Order, User
 from app.domain.enums import OrderStatus
 from app.domain.errors import (
     ActiveOrderExistsError,
+    AnalysisLimitReachedError,
     ConsentNotGivenError,
     InvalidStatusTransitionError,
     MaterialsNotReadyError,
@@ -35,7 +37,9 @@ from app.domain.errors import (
     OrderNotFoundError,
 )
 from app.domain.materials import MAX_MATERIAL_SIZE_BYTES
+from app.domain.requirements import MAX_ANALYSIS_LLM_CALLS
 from app.extraction.base import TextExtractor
+from app.llm.base import LLMClient
 from app.services.material_processing import process_pending_materials
 from app.services.order_materials import (
     MaterialStorageError,
@@ -44,6 +48,13 @@ from app.services.order_materials import (
     store_material,
 )
 from app.services.orders import change_status, create_order, get_active_order, get_user_order
+from app.services.requirements_analysis import (
+    AnalysisOutcome,
+    AnalysisOutcomeKind,
+    analyze_requirements,
+    count_analysis_calls,
+    restart_analysis,
+)
 from app.services.storage.base import FileStorage
 
 logger = logging.getLogger(__name__)
@@ -60,7 +71,7 @@ S = OrderStatus
 async def new_report(message: Message, session: AsyncSession, user: User) -> None:
     order = await get_active_order(session, user.id)
     if order is not None:
-        await _remind_active_order(message, order)
+        await _remind_active_order(message, session, order)
         return
 
     try:
@@ -71,7 +82,7 @@ async def new_report(message: Message, session: AsyncSession, user: User) -> Non
         if order is None:
             await message.answer(texts.ORDER_CREATE_FAILED)
         else:
-            await _remind_active_order(message, order)
+            await _remind_active_order(message, session, order)
         return
     order = await change_status(session, order.id, S.WAITING_FOR_CONSENT)
     # Кнопки ссылаются на order_id: заказ должен существовать до того, как их увидят.
@@ -79,12 +90,23 @@ async def new_report(message: Message, session: AsyncSession, user: User) -> Non
     await message.answer(texts.CONSENT_REQUEST, reply_markup=consent_keyboard(order.id))
 
 
-async def _remind_active_order(message: Message, order: Order) -> None:
+async def _remind_active_order(message: Message, session: AsyncSession, order: Order) -> None:
     if order.status is S.WAITING_FOR_CONSENT:
         await message.answer(texts.CONSENT_REQUEST, reply_markup=consent_keyboard(order.id))
     elif order.status is S.WAITING_FOR_FILES:
         await message.answer(
             texts.waiting_for_files(order), reply_markup=materials_keyboard(order.id)
+        )
+    elif order.status is S.ANALYZING_MATERIALS:
+        await message.answer(
+            texts.analysis_in_progress(order), reply_markup=cancel_order_keyboard(order.id)
+        )
+    elif order.status is S.FAILED and order.failed_from_status is S.ANALYZING_MATERIALS:
+        calls = await count_analysis_calls(session, order.id)
+        can_retry = calls < MAX_ANALYSIS_LLM_CALLS
+        await message.answer(
+            texts.analysis_failed(order.id, can_retry=can_retry),
+            reply_markup=analysis_failed_keyboard(order.id, can_retry=can_retry),
         )
     else:
         await message.answer(texts.active_order_exists(order))
@@ -155,12 +177,15 @@ async def finish_order_materials(
     session: AsyncSession,
     user: User,
     bot: Bot,
+    llm_client: LLMClient | None = None,
 ) -> None:
-    """«Материалы загружены»: WAITING_FOR_FILES -> ANALYZING_MATERIALS.
+    """«Материалы загружены»: WAITING_FOR_FILES -> ANALYZING_MATERIALS, затем анализ.
 
     Готовность материалов проверяет сервис под блокировкой заказа. При отказе
     транзакция откатывается до ответа в Telegram: блокировка заказа не держится во
     время сетевого запроса. Повторное и устаревшее нажатие упирается в карту переходов.
+    Анализ запускается в этом же апдейте, если подключён LLM-клиент; то, что здесь не
+    завершилось, доделывает проход восстановления анализа.
     """
     try:
         order = await get_user_order(session, user.id, callback_data.order_id)
@@ -184,10 +209,94 @@ async def finish_order_materials(
         await session.rollback()
         await callback.answer(texts.materials_not_ready(error), show_alert=True)
         return
+    order_id = completion.order.id
     await session.commit()
     await callback.answer()
     await _remove_keyboard(callback, bot)
     await _send(callback, bot, texts.materials_completed(completion))
+    if llm_client is not None:
+        await _run_analysis(callback, bot, session, llm_client, order_id)
+
+
+@router.callback_query(OrderCallback.filter(F.action == OrderAction.RETRY_ANALYSIS))
+async def retry_analysis(
+    callback: CallbackQuery,
+    callback_data: OrderCallback,
+    session: AsyncSession,
+    user: User,
+    bot: Bot,
+    llm_client: LLMClient | None = None,
+) -> None:
+    """«Повторить анализ»: FAILED -> ANALYZING_MATERIALS, затем анализ.
+
+    Лимит вызовов модели и исходный статус проверяет сервис под блокировкой заказа:
+    одновременные нажатия выполняются по очереди, второе получает отказ.
+    """
+    try:
+        order = await get_user_order(session, user.id, callback_data.order_id)
+    except OrderNotFoundError:
+        await session.rollback()
+        await callback.answer(texts.ORDER_NOT_FOUND, show_alert=True)
+        return
+    if llm_client is None:
+        await session.rollback()
+        await callback.answer(texts.ANALYSIS_UNAVAILABLE, show_alert=True)
+        return
+    try:
+        await restart_analysis(session, order.id)
+    except InvalidStatusTransitionError:
+        # lock_order обновил order актуальным статусом; текст — до rollback.
+        if order.status is S.ANALYZING_MATERIALS:
+            refusal = texts.analysis_already_restarted(order)
+        else:
+            refusal = texts.action_outdated(order)
+        await session.rollback()
+        await callback.answer(refusal, show_alert=True)
+        return
+    except AnalysisLimitReachedError:
+        await session.rollback()
+        await callback.answer(texts.ANALYSIS_LIMIT_REACHED, show_alert=True)
+        return
+    order_id = order.id
+    await session.commit()
+    await callback.answer()
+    await _remove_keyboard(callback, bot)
+    await _run_analysis(callback, bot, session, llm_client, order_id)
+
+
+async def _run_analysis(
+    callback: CallbackQuery, bot: Bot, session: AsyncSession, llm: LLMClient, order_id: int
+) -> None:
+    await _send(callback, bot, texts.ANALYSIS_STARTED)
+    try:
+        outcome = await analyze_requirements(session, llm, order_id)
+    except Exception:
+        # Ошибка БД или непредвиденный сбой: попытка будет признана прерванной и
+        # повторена проходом восстановления.
+        logger.exception("Requirements analysis failed: order_id=%s", order_id)
+        await _rollback_quietly(session)
+        await _send(callback, bot, texts.ANALYSIS_DELAYED)
+        return
+    reply = analysis_reply(outcome)
+    if reply is not None:
+        text, markup = reply
+        await _send(callback, bot, text, markup)
+
+
+def analysis_reply(outcome: AnalysisOutcome) -> tuple[str, InlineKeyboardMarkup | None] | None:
+    """Сообщение об исходе анализа; None — сообщать нечего (уже идёт, устарел и т. п.)."""
+    match outcome.kind:
+        case AnalysisOutcomeKind.COMPLETED:
+            return texts.analysis_completed(outcome), None
+        case AnalysisOutcomeKind.RETRY_LATER:
+            return texts.ANALYSIS_DELAYED, None
+        case AnalysisOutcomeKind.FAILED:
+            return (
+                texts.analysis_failed(outcome.order_id, can_retry=outcome.can_retry),
+                analysis_failed_keyboard(outcome.order_id, can_retry=outcome.can_retry),
+            )
+        case _:
+            return None
 
 
 async def _remove_keyboard(callback: CallbackQuery, bot: Bot) -> None:

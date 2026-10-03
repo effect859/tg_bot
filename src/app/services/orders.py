@@ -27,7 +27,12 @@ from app.domain.errors import (
     VersionAlreadyConfirmedError,
     VersionNotFoundError,
 )
-from app.domain.order_flow import INACTIVE_ORDER_STATUSES, PRE_PAYMENT_STATUSES, check_transition
+from app.domain.order_flow import (
+    FAILABLE_STATUSES,
+    INACTIVE_ORDER_STATUSES,
+    PRE_PAYMENT_STATUSES,
+    check_transition,
+)
 from app.domain.schemas import REQUIREMENTS_SCHEMAS, PlanContent
 
 ACTIVE_ORDER_INDEX = "uq_orders_user_id_active"
@@ -114,6 +119,12 @@ async def change_status(
             order.completed_at = func.now()
         elif target is OrderStatus.CANCELLED:
             order.cancelled_at = func.now()
+        # Смена статуса завершает текущую попытку автоматического шага; вход в шаг
+        # (в том числе повтор из FAILED) начинает счёт попыток заново. В FAILED счётчик
+        # сохраняется — для диагностики.
+        order.step_started_at = None
+        if target in FAILABLE_STATUSES:
+            order.step_attempts = 0
         order.status = target
     await session.refresh(order)
     return order

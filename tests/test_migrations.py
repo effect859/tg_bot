@@ -1,5 +1,6 @@
 import asyncio
 
+import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
@@ -139,4 +140,95 @@ def test_material_recovery_migration_downgrade_and_upgrade(database_url: str) ->
         assert [row[0] for row in asyncio.run(_query(database_url, MATERIAL_CHECKS))] == checks
     finally:
         command.upgrade(config, "head")
+        asyncio.run(_cleanup(database_url))
+
+
+# --- 0006: поля автоматического шага заказа ------------------------------------------
+
+ORDER_STEP_COLUMNS = (
+    "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns "
+    "WHERE table_name = 'orders' AND column_name LIKE 'step_%' ORDER BY column_name"
+)
+ORDER_STEP_CHECKS = (
+    "SELECT conname FROM pg_constraint WHERE conrelid = 'orders'::regclass "
+    "AND contype = 'c' AND conname LIKE 'ck_orders_step%' ORDER BY conname"
+)
+
+
+async def _seed_order(url: str, status: str) -> None:
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.begin() as connection:
+            user_id = await connection.scalar(
+                text("INSERT INTO users (tg_id) VALUES (:tg) RETURNING id"),
+                {"tg": COMMITTED_TG_ID_BASE + 600},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO orders (user_id, doc_type, status) "
+                    "VALUES (:user, 'practice_report', CAST(:status AS order_status))"
+                ),
+                {"user": user_id, "status": status},
+            )
+    finally:
+        await engine.dispose()
+
+
+def test_order_steps_migration_downgrade_and_upgrade(database_url: str) -> None:
+    config = make_alembic_config(database_url)
+    try:
+        asyncio.run(_seed_order(database_url, "analyzing_materials"))
+        columns = asyncio.run(_query(database_url, ORDER_STEP_COLUMNS))
+        assert [(c[0], c[1], c[2], c[3]) for c in columns] == [
+            ("step_attempts", "integer", "NO", "0"),
+            ("step_started_at", "timestamp with time zone", "YES", None),
+        ]
+        assert [row[0] for row in asyncio.run(_query(database_url, ORDER_STEP_CHECKS))] == [
+            "ck_orders_step_attempts_non_negative",
+            "ck_orders_step_started_at_consistent",
+        ]
+
+        command.downgrade(config, "0005")
+        assert asyncio.run(_query(database_url, ORDER_STEP_COLUMNS)) == []
+        assert asyncio.run(_query(database_url, ORDER_STEP_CHECKS)) == []
+
+        command.upgrade(config, "head")
+        # Существующая строка получила значения по умолчанию.
+        rows = asyncio.run(
+            _query(
+                database_url,
+                "SELECT step_attempts, step_started_at FROM orders WHERE user_id IN "
+                "(SELECT id FROM users WHERE tg_id >= :base)",
+                {"base": COMMITTED_TG_ID_BASE},
+            )
+        )
+        assert [tuple(r) for r in rows] == [(0, None)]
+        assert len(asyncio.run(_query(database_url, ORDER_STEP_CHECKS))) == 2
+    finally:
+        command.upgrade(config, "head")
+        asyncio.run(_cleanup(database_url))
+
+
+@pytest.mark.parametrize(
+    ("sql", "constraint"),
+    [
+        ("UPDATE orders SET step_attempts = -1", "ck_orders_step_attempts_non_negative"),
+        (
+            "UPDATE orders SET status = 'waiting_for_files', step_started_at = now()",
+            "ck_orders_step_started_at_consistent",
+        ),
+    ],
+)
+def test_order_step_constraints(database_url: str, sql: str, constraint: str) -> None:
+    try:
+        asyncio.run(_seed_order(database_url, "analyzing_materials"))
+        with pytest.raises(Exception, match=constraint):
+            asyncio.run(
+                _query(
+                    database_url,
+                    f"{sql} WHERE user_id IN (SELECT id FROM users WHERE tg_id >= :base)",
+                    {"base": COMMITTED_TG_ID_BASE},
+                )
+            )
+    finally:
         asyncio.run(_cleanup(database_url))

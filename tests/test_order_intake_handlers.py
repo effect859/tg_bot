@@ -23,18 +23,19 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot import texts
-from app.bot.handlers import order_intake
+from app.bot.handlers import menu, order_intake, start
 from app.bot.handlers.order_intake import (
     cancel_order,
     finish_order_materials,
     give_consent,
     new_report,
     receive_document,
+    retry_analysis,
 )
 from app.bot.keyboards import OrderAction, OrderCallback
-from app.bot.setup import create_dispatcher, notify_material_outcome
-from app.db.models import Order, OrderMaterial, OrderMaterialText, User
-from app.domain.enums import MaterialFailureReason, OrderStatus
+from app.bot.setup import create_dispatcher, notify_analysis_outcome, notify_material_outcome
+from app.db.models import LLMCall, Order, OrderMaterial, OrderMaterialText, User
+from app.domain.enums import LLMCallStatus, MaterialFailureReason, OrderStatus
 from app.domain.errors import (
     ConsentNotGivenError,
     MaterialLimitError,
@@ -45,12 +46,22 @@ from app.domain.errors import (
     UnsupportedMaterialError,
 )
 from app.domain.materials import MAX_MATERIAL_SIZE_BYTES, MAX_MATERIALS_PER_ORDER
+from app.domain.requirements import MAX_ANALYSIS_LLM_CALLS
 from app.extraction.base import ExtractionResult
+from app.llm.base import LLMPermanentError
 from app.services import order_materials as materials
 from app.services import orders
 from app.services.material_processing import OutcomeKind, ProcessingOutcome
+from app.services.requirements_analysis import (
+    LLM_STEP,
+    AnalysisOutcome,
+    AnalysisOutcomeKind,
+    analyze_requirements,
+)
 from app.services.storage.local import LocalFileStorage
 from app.services.users import register_or_update_user
+from fake_llm import FakeLLMClient, response_json
+from fake_llm import result as llm_result
 from material_samples import DOCX_BYTES, DOCX_MIME, PDF_BYTES, PNG_BYTES, TXT_BYTES, make_zip
 
 S = OrderStatus
@@ -1069,3 +1080,277 @@ async def test_file_after_finish_is_rejected(
         "late.pdf", "сейчас файлы не принимаются: заказ на шаге «анализ материалов»."
     )
     assert len(await _materials(session, order.id)) == 1
+
+
+# --- Анализ материалов --------------------------------------------------------------
+
+ANALYSIS_MATERIAL = "Тема: Анализ бизнес-процессов отдела продаж. Место прохождения: ООО «Ёлка»."
+ANALYSIS_GOOD = llm_result(
+    response_json(
+        topic=(
+            "Анализ бизнес-процессов отдела продаж",
+            "Тема: Анализ бизнес-процессов отдела продаж.",
+        ),
+        practice_place=("ООО «Ёлка»", "Место прохождения: ООО «Ёлка»"),
+    )
+)
+
+
+async def _ready_order(session: AsyncSession, user: User) -> int:
+    order = await _order(session, user)
+    order_id = order.id
+    await _material(session, order_id, "task.pdf", text=ANALYSIS_MATERIAL)
+    await session.commit()
+    return order_id
+
+
+async def _failed_analysis(session: AsyncSession, user: User) -> int:
+    order_id = await _ready_order(session, user)
+    await materials.finish_materials(session, order_id)
+    await session.commit()
+    await analyze_requirements(session, FakeLLMClient(LLMPermanentError("http_400")), order_id)
+    return order_id
+
+
+def _sent(bot: AsyncMock) -> list[str]:
+    return [call.args[1] for call in bot.send_message.await_args_list]
+
+
+async def test_finish_materials_runs_analysis(session: AsyncSession) -> None:
+    user = await _user(session)
+    order_id = await _ready_order(session, user)
+    bot = AsyncMock()
+    llm = FakeLLMClient(ANALYSIS_GOOD)
+
+    await finish_order_materials(_callback(), _finish_data(order_id), session, user, bot, llm)
+
+    sent = _sent(bot)
+    assert sent[0].startswith(f"📥 Материалы по заказу #{order_id} приняты.")
+    assert sent[1] == texts.ANALYSIS_STARTED
+    assert sent[2].startswith(f"📋 Материалы по заказу #{order_id} проанализированы.")
+    assert "Найдено в материалах: тема практики, место практики." in sent[2]
+    assert "Нужно уточнить: вид практики, дата начала практики" in sent[2]
+    assert await _order_status(session, order_id) is S.WAITING_FOR_MISSING_DATA
+    assert len(llm.calls) == 1
+
+
+async def test_failed_analysis_offers_retry_and_cancel(session: AsyncSession) -> None:
+    user = await _user(session)
+    order_id = await _ready_order(session, user)
+    bot = AsyncMock()
+    llm = FakeLLMClient(LLMPermanentError("http_401"))
+
+    await finish_order_materials(_callback(), _finish_data(order_id), session, user, bot, llm)
+
+    text = bot.send_message.await_args.args[1]
+    markup = bot.send_message.await_args.kwargs["reply_markup"]
+    assert text == texts.analysis_failed(order_id, can_retry=True)
+    assert "http_401" not in text
+    assert _actions(markup) == [OrderAction.RETRY_ANALYSIS, OrderAction.CANCEL]
+    assert await _order_status(session, order_id) is S.FAILED
+
+
+async def test_retry_analysis_restarts_and_analyzes(session: AsyncSession) -> None:
+    user = await _user(session)
+    order_id = await _failed_analysis(session, user)
+    callback, bot = _callback(), AsyncMock()
+    llm = FakeLLMClient(ANALYSIS_GOOD)
+
+    await retry_analysis(callback, _retry_data(order_id), session, user, bot, llm)
+
+    callback.answer.assert_awaited_once_with()
+    assert _sent(bot)[0] == texts.ANALYSIS_STARTED
+    assert _sent(bot)[1].startswith(f"📋 Материалы по заказу #{order_id} проанализированы.")
+    assert await _order_status(session, order_id) is S.WAITING_FOR_MISSING_DATA
+
+
+def _retry_data(order_id: int) -> OrderCallback:
+    return OrderCallback(action=OrderAction.RETRY_ANALYSIS, order_id=order_id)
+
+
+async def test_retry_refusals_roll_back_before_answer(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = await _user(session)
+    order_id = await _failed_analysis(session, user)
+    session.add_all(
+        LLMCall(
+            order_id=order_id,
+            step=LLM_STEP,
+            provider="fake",
+            model="m",
+            status=LLMCallStatus.ERROR,
+            error="http_503",
+        )
+        for _ in range(MAX_ANALYSIS_LLM_CALLS - 1)  # плюс один уже сделанный — лимит
+    )
+    await session.commit()
+    callback, bot = _callback(), AsyncMock()
+    log = _CallLog(session, monkeypatch)
+    log.telegram(callback.answer, "answer")
+    llm = FakeLLMClient(ANALYSIS_GOOD)
+
+    await retry_analysis(callback, _retry_data(order_id), session, user, bot, llm)
+
+    assert log.calls == ["rollback", "answer"]
+    assert callback.answer.await_args.args[0] == texts.ANALYSIS_LIMIT_REACHED
+    assert callback.answer.await_args.kwargs == {"show_alert": True}
+    assert await _order_status(session, order_id) is S.FAILED
+    assert llm.calls == []
+    bot.send_message.assert_not_awaited()
+
+
+async def test_retry_button_after_analysis_is_outdated(session: AsyncSession) -> None:
+    user = await _user(session)
+    order_id = await _failed_analysis(session, user)
+    await retry_analysis(
+        _callback(), _retry_data(order_id), session, user, AsyncMock(), FakeLLMClient(ANALYSIS_GOOD)
+    )
+    callback = _callback()
+    order = await session.get(Order, order_id, populate_existing=True)
+    assert order is not None
+    expected = texts.action_outdated(order)
+
+    await retry_analysis(
+        callback, _retry_data(order_id), session, user, AsyncMock(), FakeLLMClient(ANALYSIS_GOOD)
+    )
+
+    assert callback.answer.await_args.args[0] == expected
+    assert await _order_status(session, order_id) is S.WAITING_FOR_MISSING_DATA
+
+
+async def test_retry_of_foreign_order_does_nothing(session: AsyncSession) -> None:
+    owner = await _user(session, tg_id=1)
+    stranger = await _user(session, tg_id=2)
+    order_id = await _failed_analysis(session, owner)
+    callback = _callback(tg_id=2)
+
+    await retry_analysis(
+        callback, _retry_data(order_id), session, stranger, AsyncMock(), FakeLLMClient()
+    )
+
+    callback.answer.assert_awaited_once_with(texts.ORDER_NOT_FOUND, show_alert=True)
+    assert await _order_status(session, order_id) is S.FAILED
+
+
+async def test_retry_without_llm_is_unavailable(session: AsyncSession) -> None:
+    user = await _user(session)
+    order_id = await _failed_analysis(session, user)
+    callback = _callback()
+
+    await retry_analysis(callback, _retry_data(order_id), session, user, AsyncMock(), None)
+
+    callback.answer.assert_awaited_once_with(texts.ANALYSIS_UNAVAILABLE, show_alert=True)
+    assert await _order_status(session, order_id) is S.FAILED
+
+
+async def test_reminder_during_analysis_has_cancel(session: AsyncSession) -> None:
+    user = await _user(session)
+    order_id = await _ready_order(session, user)
+    await materials.finish_materials(session, order_id)
+    await session.commit()
+    message = AsyncMock()
+
+    await new_report(message, session, user)
+
+    assert message.answer.await_args.args[0].startswith(f"Заказ #{order_id}: идёт анализ")
+    assert _actions(message.answer.await_args.kwargs["reply_markup"]) == [OrderAction.CANCEL]
+
+
+@pytest.mark.parametrize("at_limit", [False, True])
+async def test_reminder_after_failed_analysis(session: AsyncSession, at_limit: bool) -> None:
+    user = await _user(session)
+    order_id = await _failed_analysis(session, user)
+    if at_limit:
+        session.add_all(
+            LLMCall(
+                order_id=order_id,
+                step=LLM_STEP,
+                provider="f",
+                model="m",
+                status=LLMCallStatus.ERROR,
+                error="x",
+            )
+            for _ in range(MAX_ANALYSIS_LLM_CALLS - 1)
+        )
+        await session.commit()
+    message = AsyncMock()
+
+    await new_report(message, session, user)
+
+    actions = _actions(message.answer.await_args.kwargs["reply_markup"])
+    if at_limit:
+        assert actions == [OrderAction.CANCEL]
+        assert texts.ANALYSIS_LIMIT_REACHED in message.answer.await_args.args[0]
+    else:
+        assert actions == [OrderAction.RETRY_ANALYSIS, OrderAction.CANCEL]
+
+
+@pytest.mark.parametrize("failed", [False, True], ids=["analyzing", "failed"])
+async def test_cancel_during_or_after_analysis(session: AsyncSession, failed: bool) -> None:
+    user = await _user(session)
+    if failed:
+        order_id = await _failed_analysis(session, user)
+    else:
+        order_id = await _ready_order(session, user)
+        await materials.finish_materials(session, order_id)
+        await session.commit()
+
+    await cancel_order(
+        _callback(),
+        OrderCallback(action=OrderAction.CANCEL, order_id=order_id),
+        session,
+        user,
+        AsyncMock(),
+    )
+
+    assert await _order_status(session, order_id) is S.CANCELLED
+
+
+async def test_background_analysis_notification_keeps_keyboard() -> None:
+    bot = AsyncMock()
+    failed = AnalysisOutcome(AnalysisOutcomeKind.FAILED, 5, can_retry=False)
+    busy = AnalysisOutcome(AnalysisOutcomeKind.BUSY, 5)
+
+    await notify_analysis_outcome(bot, 42, failed)
+    await notify_analysis_outcome(bot, 42, busy)
+
+    bot.send_message.assert_awaited_once()
+    assert bot.send_message.await_args.args == (42, texts.analysis_failed(5, can_retry=False))
+    assert _actions(bot.send_message.await_args.kwargs["reply_markup"]) == [OrderAction.CANCEL]
+
+
+def test_truncation_is_reported_to_user() -> None:
+    outcome = AnalysisOutcome(
+        AnalysisOutcomeKind.COMPLETED,
+        5,
+        status=S.WAITING_FOR_MISSING_DATA,
+        found=("topic",),
+        missing=("university",),
+        truncated_material=3,
+        omitted_materials=(4, 5),
+    )
+
+    text = texts.analysis_completed(outcome)
+
+    assert "учтены первые 400 000 символов (файл №3 — частично; не вошли: №4, №5)" in text
+
+
+def test_dispatcher_registers_analysis_recovery_with_llm(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    file_storage: LocalFileStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def detach() -> None:
+        for router in (start.router, menu.router, order_intake.router):
+            monkeypatch.setattr(router, "_parent_router", None)
+
+    detach()
+    without = create_dispatcher(sessionmaker, MemoryStorage(), file_storage)
+    detach()
+    llm = FakeLLMClient()
+    with_llm = create_dispatcher(sessionmaker, MemoryStorage(), file_storage, None, llm)
+
+    assert with_llm["llm_client"] is llm
+    assert len(with_llm.startup.handlers) == len(without.startup.handlers) + 1
+    assert len(with_llm.shutdown.handlers) == len(without.shutdown.handlers) + 1

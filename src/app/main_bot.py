@@ -7,9 +7,10 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.redis import RedisStorage
 
 from app.bot.setup import create_dispatcher
-from app.config import get_settings
+from app.config import get_settings, require_llm_api_key
 from app.db.session import create_engine, create_sessionmaker
 from app.extraction.runner import SubprocessTextExtractor
+from app.llm.anthropic import AnthropicLLMClient
 from app.logging_setup import setup_logging
 from app.services.storage.local import LocalFileStorage
 
@@ -19,6 +20,8 @@ logger = logging.getLogger(__name__)
 async def main() -> None:
     settings = get_settings()
     setup_logging(settings.log_level)
+    # До создания подключений: без LLM бот не должен запускаться как работоспособный.
+    llm_client = AnthropicLLMClient(api_key=require_llm_api_key(settings), model=settings.llm_model)
 
     engine = create_engine(settings)
     storage = RedisStorage.from_url(settings.redis_url)
@@ -34,6 +37,7 @@ async def main() -> None:
         storage,
         LocalFileStorage(settings.storage_dir),
         text_extractor,
+        llm_client,
     )
 
     logger.info("Bot is starting (polling)")
