@@ -140,6 +140,22 @@ class AnalysisLimitReachedError(OrderDomainError):
         self.limit = limit
 
 
+class RequirementFieldNotEditableError(OrderDomainError):
+    """Поле ТЗ нельзя изменить из диалога: редактируются только обязательные поля."""
+
+    def __init__(self, field: str) -> None:
+        super().__init__(f"Requirement field {field!r} is not editable")
+        self.field = field
+
+
+class RequirementsChangedError(OrderDomainError):
+    """ТЗ изменилось после того, как пользователь его увидел: подтверждать нечего."""
+
+    def __init__(self, order_id: int) -> None:
+        super().__init__(f"Order {order_id}: requirements changed since they were shown")
+        self.order_id = order_id
+
+
 class MaterialNotFoundError(OrderDomainError):
     def __init__(self, material_id: int) -> None:
         super().__init__(f"Material {material_id} not found")

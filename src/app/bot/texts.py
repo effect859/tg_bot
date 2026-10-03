@@ -1,6 +1,7 @@
 """Тексты бота. Сообщения отправляются с parse_mode=HTML: пользовательские данные экранируем."""
 
 from collections.abc import Sequence
+from datetime import date
 from html import escape
 
 from app.db.models import Order
@@ -21,7 +22,8 @@ from app.domain.materials import (
     MAX_MATERIALS_PER_ORDER,
     MaterialCompletionState,
 )
-from app.domain.requirements import MAX_ANALYSIS_INPUT_CHARS
+from app.domain.requirements import MAX_ANALYSIS_INPUT_CHARS, REQUIRED_FIELDS
+from app.domain.requirements_dialog import TEXT_ANSWER_LIMITS, AnswerError
 from app.extraction.base import WarningCode
 from app.services.material_processing import OutcomeKind, ProcessingOutcome
 from app.services.order_materials import MaterialsCompletion
@@ -43,7 +45,8 @@ ORDER_STATUS_LABELS: dict[OrderStatus, str] = {
     OrderStatus.ANALYZING_MATERIALS: "анализ материалов",
     OrderStatus.WAITING_FOR_MISSING_DATA: "нужны данные",
     OrderStatus.WAITING_FOR_DATA_CONFIRMATION: "подтверждение данных",
-    OrderStatus.PREPARING_PLAN: "составляется план",
+    # План в 2.8 ещё не строится: честно называем то, что уже сделано.
+    OrderStatus.PREPARING_PLAN: "ТЗ подтверждено",
     OrderStatus.WAITING_FOR_PLAN_CONFIRMATION: "подтверждение плана",
     OrderStatus.PAYMENT_PENDING: "ожидает оплаты",
     OrderStatus.PAID: "оплачен",
@@ -189,6 +192,59 @@ ANALYSIS_DELAYED = (
 ANALYSIS_LIMIT_REACHED = "Лимит попыток анализа исчерпан. Отмените заказ, чтобы оформить новый."
 ANALYSIS_UNAVAILABLE = "Анализ материалов сейчас недоступен. Попробуйте позже."
 
+# --- Уточнение и подтверждение ТЗ ---------------------------------------------------
+
+BTN_CONFIRM_REQUIREMENTS = "✅ Подтвердить ТЗ"
+BTN_EDIT_REQUIREMENTS = "✏️ Изменить"
+# Даты меняются вместе: одна кнопка на обе.
+BTN_EDIT_DATES = "Даты практики"
+
+DATE_INPUT_HINT = "в формате ДД.ММ.ГГГГ, например 01.07.2026"
+# Вопросы по обязательным полям — по одному, в порядке REQUIRED_FIELDS.
+REQUIREMENT_QUESTIONS: dict[str, str] = {
+    "topic": "Какая тема практики (или индивидуального задания)?",
+    "practice_type": "Какой вид практики? Например: учебная, производственная, преддипломная.",
+    "practice_place": "Где вы проходите практику? Укажите организацию или подразделение.",
+    "practice_start": f"Когда началась практика? Укажите дату {DATE_INPUT_HINT}.",
+    "practice_end": f"Когда заканчивается практика? Укажите дату {DATE_INPUT_HINT}.",
+    "university": "В каком вузе вы учитесь? Укажите полное название.",
+    "student_name": "Как вас зовут? Укажите фамилию, имя и отчество.",
+}
+ANSWER_ERROR_TEXTS: dict[AnswerError, str] = {
+    AnswerError.EMPTY: "Ответ пустой.",
+    AnswerError.INVALID_CHARS: "В ответе есть недопустимые символы.",
+    AnswerError.NO_LETTERS: "Ответ должен содержать хотя бы две буквы.",
+    AnswerError.DIGITS_IN_NAME: "В ФИО не должно быть цифр.",
+    AnswerError.INVALID_DATE: f"Не удалось распознать дату. Укажите её {DATE_INPUT_HINT}.",
+    AnswerError.DATE_OUT_OF_RANGE: "Дата должна быть в пределах 2000–2100 годов.",
+}
+DATES_RESET = "Дата начала позже даты окончания. Укажите даты заново."
+ANSWER_FAILED = "Не удалось сохранить ответ из-за технической ошибки. Отправьте его ещё раз."
+REQUIREMENTS_UNAVAILABLE = "Не удалось открыть ТЗ из-за технической ошибки. Попробуйте позже."
+REQUIREMENTS_ACTION_FAILED = (
+    "Не удалось выполнить действие из-за технической ошибки. Попробуйте ещё раз."
+)
+REQUIREMENTS_EDIT_CHOOSE = "Что изменить? Выберите поле — я задам вопрос о нём заново."
+REQUIREMENT_NOT_EDITABLE = "Это поле нельзя изменить."
+REQUIREMENTS_CHANGED = "ТЗ изменилось после этого сообщения. Проверьте актуальную версию."
+REQUIREMENTS_ALREADY_CONFIRMED = "ТЗ уже подтверждено."
+REQUIREMENTS_CONFIRMED = "ТЗ подтверждено. Следующий шаг — подготовка плана отчёта."
+REQUIREMENTS_CONFIRM_PROMPT = "Проверьте данные. Если всё верно — подтвердите ТЗ."
+
+# Лимит Telegram на длину сообщения. Резюме ТЗ укладывается в него при любых данных.
+MAX_MESSAGE_CHARS = 4096
+# Шаги сокращения резюме: (символов на значение, доптребований), от подробного к краткому.
+SUMMARY_LIMITS: tuple[tuple[int, int], ...] = ((500, 10), (200, 5), (100, 3), (40, 1))
+# Необязательные поля в резюме — то, что нашёл анализ; редактировать их нельзя.
+SUMMARY_OPTIONAL_FIELDS: tuple[str, ...] = (
+    "specialty",
+    "student_group",
+    "supervisor",
+    "target_pages",
+)
+# Сколько символов значения показывать в подтверждении ответа.
+ANSWER_PREVIEW_LENGTH = 200
+
 NO_ORDERS = "У вас пока нет заказов."
 
 HELP = (
@@ -297,10 +353,102 @@ def analysis_completed(outcome: AnalysisOutcome) -> str:
         )
     lines.append("")
     if outcome.status is OrderStatus.WAITING_FOR_DATA_CONFIRMATION:
-        lines.append("Следующий шаг — подтверждение ТЗ. Сообщим, когда он будет готов.")
+        lines.append(
+            "Все данные для ТЗ найдены. Чтобы проверить и подтвердить ТЗ, отправьте /start."
+        )
     else:
-        lines.append("Следующий шаг — уточнение данных. Сообщим, когда он будет готов.")
+        lines.append("Осталось уточнить несколько данных — задам вопросы по одному.")
     return "\n".join(lines)
+
+
+def field_label(field: str) -> str:
+    """Название поля ТЗ с заглавной буквы — для резюме и кнопок."""
+    label = REQUIREMENT_LABELS.get(field, field)
+    return label[:1].upper() + label[1:]
+
+
+def question(field: str) -> str:
+    return f"❓ {REQUIREMENT_QUESTIONS[field]}"
+
+
+def question_reminder(order_id: int, field: str) -> str:
+    return f"Заказ #{order_id}: нужно уточнить данные для ТЗ.\n\n{question(field)}"
+
+
+def answer_rejected(field: str, error: AnswerError) -> str:
+    if error is AnswerError.TOO_LONG:
+        reason = f"Слишком длинный ответ: не больше {TEXT_ANSWER_LIMITS[field]} символов."
+    else:
+        reason = ANSWER_ERROR_TEXTS[error]
+    return f"⚠️ {reason}\n\n{question(field)}"
+
+
+def answer_accepted(field: str, value: str) -> str:
+    """Что записано — чтобы ответ, попавший не в то поле, было видно сразу."""
+    shown = _field_value(field, value, ANSWER_PREVIEW_LENGTH)
+    return f"✅ Записал: {REQUIREMENT_LABELS.get(field, field)} — {shown}."
+
+
+def requirements_confirmed_state(order_id: int) -> str:
+    return f"Заказ #{order_id}: {REQUIREMENTS_CONFIRMED}"
+
+
+def requirements_summary(order_id: int, content: dict[str, object]) -> str:
+    """Резюме ТЗ для подтверждения: без технических полей, данные экранированы.
+
+    Длинные значения сокращаются по шагам SUMMARY_LIMITS, пока резюме не уложится
+    в лимит сообщения Telegram (последний шаг укладывается при любых данных).
+    """
+    text = ""
+    for value_limit, max_items in SUMMARY_LIMITS:
+        text = _render_summary(order_id, content, value_limit, max_items)
+        if len(text) <= MAX_MESSAGE_CHARS:
+            break
+    return text
+
+
+def _render_summary(
+    order_id: int, content: dict[str, object], value_limit: int, max_items: int
+) -> str:
+    lines = [f"📋 <b>ТЗ отчёта по практике — заказ #{order_id}</b>", ""]
+    for name in REQUIRED_FIELDS:
+        shown = _field_value(name, content.get(name), value_limit)
+        lines.append(f"<b>{field_label(name)}:</b> {shown}")
+    optional = [name for name in SUMMARY_OPTIONAL_FIELDS if content.get(name) not in (None, "")]
+    raw_extra = content.get("extra_requirements")
+    extra = (
+        [item for item in raw_extra if isinstance(item, str)] if isinstance(raw_extra, list) else []
+    )
+    if optional or extra:
+        lines += ["", "<i>Найдено в материалах:</i>"]
+        for name in optional:
+            shown = _field_value(name, content.get(name), value_limit)
+            lines.append(f"<b>{field_label(name)}:</b> {shown}")
+        if extra:
+            lines.append(f"<b>{field_label('extra_requirements')}:</b>")
+            lines += [f"• {_preview(item, value_limit)}" for item in extra[:max_items]]
+            if len(extra) > max_items:
+                lines.append(f"…и ещё {len(extra) - max_items}")
+    lines += ["", REQUIREMENTS_CONFIRM_PROMPT]
+    return "\n".join(lines)
+
+
+def _field_value(field: str, value: object, limit: int) -> str:
+    """Значение поля для пользователя: даты — ДД.ММ.ГГГГ, текст — сокращён и экранирован."""
+    if value is None or value == "":
+        return "—"
+    if field in ("practice_start", "practice_end") and isinstance(value, str):
+        return date.fromisoformat(value).strftime("%d.%m.%Y")
+    if field == "target_pages":
+        return f"{value} стр."
+    return _preview(str(value), limit)
+
+
+def _preview(text: str, limit: int) -> str:
+    # Сокращаем до экранирования, чтобы не разрезать HTML-сущность.
+    if len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return escape(text, quote=False)
 
 
 def analysis_failed(order_id: int, *, can_retry: bool) -> str:

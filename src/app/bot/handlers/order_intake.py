@@ -24,6 +24,7 @@ from app.bot.keyboards import (
     main_menu_keyboard,
     materials_keyboard,
 )
+from app.bot.reminders import remind_active_order
 from app.bot.telegram_files import FileDownloadError, FileTooLargeError, download_document
 from app.db.models import Order, User
 from app.domain.enums import OrderStatus
@@ -37,7 +38,6 @@ from app.domain.errors import (
     OrderNotFoundError,
 )
 from app.domain.materials import MAX_MATERIAL_SIZE_BYTES
-from app.domain.requirements import MAX_ANALYSIS_LLM_CALLS
 from app.extraction.base import TextExtractor
 from app.llm.base import LLMClient
 from app.services.material_processing import process_pending_materials
@@ -52,7 +52,6 @@ from app.services.requirements_analysis import (
     AnalysisOutcome,
     AnalysisOutcomeKind,
     analyze_requirements,
-    count_analysis_calls,
     restart_analysis,
 )
 from app.services.storage.base import FileStorage
@@ -71,7 +70,7 @@ S = OrderStatus
 async def new_report(message: Message, session: AsyncSession, user: User) -> None:
     order = await get_active_order(session, user.id)
     if order is not None:
-        await _remind_active_order(message, session, order)
+        await remind_active_order(message, session, order)
         return
 
     try:
@@ -82,34 +81,12 @@ async def new_report(message: Message, session: AsyncSession, user: User) -> Non
         if order is None:
             await message.answer(texts.ORDER_CREATE_FAILED)
         else:
-            await _remind_active_order(message, session, order)
+            await remind_active_order(message, session, order)
         return
     order = await change_status(session, order.id, S.WAITING_FOR_CONSENT)
     # Кнопки ссылаются на order_id: заказ должен существовать до того, как их увидят.
     await session.commit()
     await message.answer(texts.CONSENT_REQUEST, reply_markup=consent_keyboard(order.id))
-
-
-async def _remind_active_order(message: Message, session: AsyncSession, order: Order) -> None:
-    if order.status is S.WAITING_FOR_CONSENT:
-        await message.answer(texts.CONSENT_REQUEST, reply_markup=consent_keyboard(order.id))
-    elif order.status is S.WAITING_FOR_FILES:
-        await message.answer(
-            texts.waiting_for_files(order), reply_markup=materials_keyboard(order.id)
-        )
-    elif order.status is S.ANALYZING_MATERIALS:
-        await message.answer(
-            texts.analysis_in_progress(order), reply_markup=cancel_order_keyboard(order.id)
-        )
-    elif order.status is S.FAILED and order.failed_from_status is S.ANALYZING_MATERIALS:
-        calls = await count_analysis_calls(session, order.id)
-        can_retry = calls < MAX_ANALYSIS_LLM_CALLS
-        await message.answer(
-            texts.analysis_failed(order.id, can_retry=can_retry),
-            reply_markup=analysis_failed_keyboard(order.id, can_retry=can_retry),
-        )
-    else:
-        await message.answer(texts.active_order_exists(order))
 
 
 @router.callback_query(OrderCallback.filter(F.action == OrderAction.CONSENT))
@@ -286,6 +263,10 @@ async def _run_analysis(
 def analysis_reply(outcome: AnalysisOutcome) -> tuple[str, InlineKeyboardMarkup | None] | None:
     """Сообщение об исходе анализа; None — сообщать нечего (уже идёт, устарел и т. п.)."""
     match outcome.kind:
+        case AnalysisOutcomeKind.COMPLETED if outcome.missing:
+            # Уточнение данных начинается сразу: первый вопрос — первое незаполненное поле.
+            text = f"{texts.analysis_completed(outcome)}\n\n{texts.question(outcome.missing[0])}"
+            return text, cancel_order_keyboard(outcome.order_id)
         case AnalysisOutcomeKind.COMPLETED:
             return texts.analysis_completed(outcome), None
         case AnalysisOutcomeKind.RETRY_LATER:

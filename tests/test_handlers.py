@@ -11,14 +11,18 @@ from app.domain.enums import DocType
 from app.services.users import register_or_update_user
 
 
-async def test_start_greets_and_shows_menu() -> None:
+async def test_start_greets_and_shows_menu(session: AsyncSession) -> None:
     message = AsyncMock()
     state = AsyncMock()
-    user = User(tg_id=1, first_name="<b>Пётр</b>")
+    user = await register_or_update_user(
+        session, tg_id=1, username=None, first_name="<b>Пётр</b>", language_code=None
+    )
 
-    await cmd_start(message, state, user)
+    await cmd_start(message, state, user, session)
 
     state.clear.assert_awaited_once()
+    # Активного заказа нет: только приветствие, как и раньше.
+    message.answer.assert_awaited_once()
     text = message.answer.await_args.args[0]
     assert "&lt;b&gt;Пётр&lt;/b&gt;" in text  # имя экранировано для HTML
     keyboard = message.answer.await_args.kwargs["reply_markup"]

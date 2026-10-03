@@ -6,7 +6,7 @@ from aiogram.fsm.storage.base import BaseStorage
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot import texts
-from app.bot.handlers import menu, order_intake, start
+from app.bot.handlers import menu, order_intake, requirements_dialog, start
 from app.bot.middlewares.db import DbSessionMiddleware
 from app.bot.middlewares.user import UserMiddleware
 from app.extraction.base import TextExtractor
@@ -37,7 +37,11 @@ def create_dispatcher(
     dispatcher.update.outer_middleware(DbSessionMiddleware(sessionmaker))
     dispatcher.update.outer_middleware(UserMiddleware())
 
-    dispatcher.include_routers(start.router, menu.router, order_intake.router)
+    # Роутер уточнения ТЗ — последним: его хендлер обычного текста не должен
+    # перехватывать команды, кнопки меню и документы.
+    dispatcher.include_routers(
+        start.router, menu.router, order_intake.router, requirements_dialog.router
+    )
     if text_extractor is not None:
         _run_while_polling(
             dispatcher,

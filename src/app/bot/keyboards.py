@@ -9,6 +9,7 @@ from aiogram.types import (
 )
 
 from app.bot import texts
+from app.domain.requirements_dialog import EDITABLE_FIELDS
 
 
 class OrderAction(StrEnum):
@@ -23,6 +24,26 @@ class OrderCallback(CallbackData, prefix="order"):
 
     action: OrderAction
     order_id: int
+
+
+class RequirementsAction(StrEnum):
+    CONFIRM = "confirm"
+    EDIT = "edit"
+    EDIT_FIELD = "field"
+
+
+class RequirementsCallback(CallbackData, prefix="req"):
+    """Кнопка уточнения ТЗ. Всё приходит от клиента: владельца, статус и поле
+    проверяет хендлер и сервис.
+
+    ``digest`` — отпечаток ТЗ на экране подтверждения: «Подтвердить» под устаревшим
+    резюме не подтвердит изменившееся с тех пор ТЗ.
+    """
+
+    action: RequirementsAction
+    order_id: int
+    field: str = ""
+    digest: str = ""
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -63,6 +84,44 @@ def analysis_failed_keyboard(order_id: int, *, can_retry: bool) -> InlineKeyboar
     if can_retry:
         rows.insert(
             0, [_order_button(texts.BTN_RETRY_ANALYSIS, OrderAction.RETRY_ANALYSIS, order_id)]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _requirements_button(
+    text: str, action: RequirementsAction, order_id: int, **kwargs: str
+) -> InlineKeyboardButton:
+    data = RequirementsCallback(action=action, order_id=order_id, **kwargs)
+    return InlineKeyboardButton(text=text, callback_data=data.pack())
+
+
+def confirmation_keyboard(order_id: int, digest: str) -> InlineKeyboardMarkup:
+    """Экран подтверждения ТЗ: подтвердить, изменить обязательное поле или отменить заказ."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                _requirements_button(
+                    texts.BTN_CONFIRM_REQUIREMENTS,
+                    RequirementsAction.CONFIRM,
+                    order_id,
+                    digest=digest,
+                )
+            ],
+            [_requirements_button(texts.BTN_EDIT_REQUIREMENTS, RequirementsAction.EDIT, order_id)],
+            [_order_button(texts.BTN_CANCEL_ORDER, OrderAction.CANCEL, order_id)],
+        ]
+    )
+
+
+def edit_fields_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    """Обязательные поля, которые можно изменить; обе даты — одной кнопкой."""
+    rows = []
+    for field in EDITABLE_FIELDS:
+        if field == "practice_end":
+            continue  # меняется вместе с датой начала
+        label = texts.BTN_EDIT_DATES if field == "practice_start" else texts.field_label(field)
+        rows.append(
+            [_requirements_button(label, RequirementsAction.EDIT_FIELD, order_id, field=field)]
         )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
