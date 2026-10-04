@@ -14,8 +14,8 @@ from pydantic import SecretStr
 
 from app import main_bot
 from app.config import ConfigurationError, Settings, require_llm_api_key
-from app.llm.anthropic import DEFAULT_TIMEOUT_SECONDS, AnthropicLLMClient
-from app.llm.base import LLMPermanentError, LLMTemporaryError, StopReason
+from app.llm.anthropic import DEFAULT_TIMEOUT_SECONDS, MAX_CACHE_BREAKPOINTS, AnthropicLLMClient
+from app.llm.base import LLMPermanentError, LLMTemporaryError, PromptBlock, StopReason
 
 SCHEMA = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
 
@@ -36,6 +36,17 @@ def _message(text: str = '{"fields": {}}', stop_reason: str = "end_turn") -> dic
             "cache_creation_input_tokens": 0,
         },
     }
+
+
+def _usage_message(*, cache_read: int | None, cache_creation: int | None) -> dict[str, Any]:
+    message = _message()
+    message["usage"] = {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_creation,
+    }
+    return message
 
 
 class Transport:
@@ -90,6 +101,7 @@ async def test_request_body_and_result() -> None:
     assert result.model == "claude-sonnet-5-5"
     assert (result.usage.input_tokens, result.usage.output_tokens) == (1500, 120)
     assert result.usage.cached_tokens == 300
+    assert result.usage.cache_creation_tokens == 0
     assert result.stop_reason is StopReason.END_TURN
     assert result.latency_ms >= 0
 
@@ -102,6 +114,59 @@ async def test_model_override() -> None:
     )
 
     assert json.loads(transport.requests[0].content)["model"] == "claude-haiku-4-5"
+
+
+async def test_prefix_blocks_with_cache_breakpoints() -> None:
+    transport = Transport(httpx2.Response(200, json=_message()))
+    prefix = [
+        PromptBlock("CONTEXT", cache_ttl="1h"),
+        PromptBlock("S1"),
+        PromptBlock("S2", cache_ttl="1h"),
+    ]
+
+    await _client(transport).complete(system="s", prompt="TASK", max_tokens=10, prefix=prefix)
+
+    [message] = json.loads(transport.requests[0].content)["messages"]
+    assert message == {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": "CONTEXT",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            },
+            {"type": "text", "text": "S1"},
+            {"type": "text", "text": "S2", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            # Задание — последним блоком, без точки кэша.
+            {"type": "text", "text": "TASK"},
+        ],
+    }
+
+
+async def test_too_many_cache_breakpoints_rejected_before_request() -> None:
+    transport = Transport(httpx2.Response(200, json=_message()))
+    prefix = [PromptBlock(f"B{i}", cache_ttl="1h") for i in range(MAX_CACHE_BREAKPOINTS + 1)]
+
+    with pytest.raises(ValueError):
+        await _client(transport).complete(system="s", prompt="p", max_tokens=10, prefix=prefix)
+
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize(
+    ("cache_read", "cache_creation", "expected"),
+    [(300, 1200, (300, 1200)), (None, None, (0, 0))],
+)
+async def test_cache_usage_mapping(
+    cache_read: int | None, cache_creation: int | None, expected: tuple[int, int]
+) -> None:
+    message = _usage_message(cache_read=cache_read, cache_creation=cache_creation)
+    transport = Transport(httpx2.Response(200, json=message))
+
+    result = await _complete(_client(transport))
+
+    # cached_tokens — чтение из кэша, cache_creation_tokens — запись в кэш.
+    assert (result.usage.cached_tokens, result.usage.cache_creation_tokens) == expected
 
 
 @pytest.mark.parametrize(

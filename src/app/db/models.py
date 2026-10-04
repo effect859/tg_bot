@@ -183,6 +183,34 @@ class OrderPlanVersion(_OrderVersionMixin, Base):
     )
 
 
+class OrderReportSection(Base):
+    """Сгенерированный текст раздела подтверждённого плана: строка = готовый раздел.
+
+    Строка только вставляется. Статуса нет: попытка генерации живёт в полях шага
+    заказа, ошибки — в llm_calls, объём раздела — в плане. Названия разделов и
+    подразделов — в плане, здесь только текст.
+    """
+
+    __tablename__ = "order_report_sections"
+    __table_args__ = (
+        # Один текст на раздел плана: повторное сохранение раздела невозможно.
+        UniqueConstraint("plan_version_id", "section_index"),
+        CheckConstraint("section_index >= 0", name="section_index_non_negative"),
+        CheckConstraint("char_count > 0", name="char_count_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), index=True)
+    plan_version_id: Mapped[int] = mapped_column(ForeignKey("order_plan_versions.id"))
+    # Номер раздела в plan.content["sections"], с нуля.
+    section_index: Mapped[int] = mapped_column(Integer)
+    # {"paragraphs": [...], "subsections": [{"paragraphs": [...]}]}
+    content: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    # Символы с пробелами во всех абзацах раздела и подразделов.
+    char_count: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class OrderMaterial(TimestampMixin, Base):
     """Материал заказа, присланный пользователем (задание, методичка, пример отчёта).
 
@@ -357,7 +385,9 @@ class LLMCall(Base):
     model: Mapped[str] = mapped_column(String(64))
     input_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     output_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    # Прочитано из кэша промпта и записано в него (у Anthropic — не в input_tokens).
     cached_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    cache_creation_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     status: Mapped[LLMCallStatus] = mapped_column(_pg_enum(LLMCallStatus, "llm_call_status"))

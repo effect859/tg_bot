@@ -5,16 +5,34 @@
 учёт в llm_calls) решает вызывающий код.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
+
+CacheTTL = Literal["5m", "1h"]
 
 
 @dataclass(frozen=True, slots=True)
 class LLMUsage:
     input_tokens: int
     output_tokens: int
+    # Прочитано из кэша промпта.
     cached_tokens: int = 0
+    # Записано в кэш промпта (у провайдера — отдельно от input_tokens).
+    cache_creation_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PromptBlock:
+    """Часть запроса перед ``prompt``. ``cache_ttl`` — точка кэша промпта после блока.
+
+    Кэш — совпадение префикса запроса: блоки, одинаковые у нескольких запросов,
+    идут первыми, а точки кэша ставятся на границах этих общих частей.
+    """
+
+    text: str
+    cache_ttl: CacheTTL | None = None
 
 
 class StopReason(StrEnum):
@@ -69,12 +87,14 @@ class LLMClient(Protocol):
         max_tokens: int,
         model: str | None = None,
         json_schema: dict[str, Any] | None = None,
+        prefix: Sequence[PromptBlock] = (),
     ) -> LLMResult:
         """Один запрос к модели.
 
-        ``json_schema`` — ответ строго по схеме (текст результата — JSON). Ответ,
-        полученный от провайдера, возвращается всегда, в том числе обрезанный или
-        с отказом — см. ``stop_reason``. Ошибки запроса — LLMTemporaryError и
-        LLMPermanentError. Расход токенов вызывающий код пишет в llm_calls.
+        ``prefix`` — блоки запроса перед ``prompt`` (с точками кэша промпта); пустой —
+        запрос из одного ``prompt``. ``json_schema`` — ответ строго по схеме (текст
+        результата — JSON). Ответ, полученный от провайдера, возвращается всегда, в
+        том числе обрезанный или с отказом — см. ``stop_reason``. Ошибки запроса —
+        LLMTemporaryError и LLMPermanentError. Расход токенов вызывающий код пишет в llm_calls.
         """
         ...

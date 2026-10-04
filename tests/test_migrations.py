@@ -232,3 +232,154 @@ def test_order_step_constraints(database_url: str, sql: str, constraint: str) ->
             )
     finally:
         asyncio.run(_cleanup(database_url))
+
+
+# --- 0007: тексты разделов отчёта и запись в кэш промпта -----------------------------
+
+REPORT_SECTION_TABLE = "SELECT to_regclass('order_report_sections')::text"
+REPORT_SECTION_CONSTRAINTS = (
+    "SELECT conname FROM pg_constraint WHERE conrelid = 'order_report_sections'::regclass "
+    "AND contype IN ('c', 'u', 'f') ORDER BY conname"
+)
+CACHE_CREATION_COLUMN = (
+    "SELECT data_type, is_nullable, column_default FROM information_schema.columns "
+    "WHERE table_name = 'llm_calls' AND column_name = 'cache_creation_tokens'"
+)
+SEEDED_ORDERS = "SELECT id FROM orders WHERE user_id IN (SELECT id FROM users WHERE tg_id >= :base)"
+
+
+async def _seed_plan(url: str) -> dict[str, int]:
+    """Заказ с черновиками ТЗ и плана (зафиксировано): id заказа и плана."""
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.begin() as connection:
+            user_id = await connection.scalar(
+                text("INSERT INTO users (tg_id) VALUES (:tg) RETURNING id"),
+                {"tg": COMMITTED_TG_ID_BASE + 700},
+            )
+            order_id = await connection.scalar(
+                text(
+                    "INSERT INTO orders (user_id, doc_type, status) "
+                    "VALUES (:user, 'practice_report', 'waiting_for_files') RETURNING id"
+                ),
+                {"user": user_id},
+            )
+            requirements_id = await connection.scalar(
+                text(
+                    "INSERT INTO order_requirements_versions (order_id, version, status, content) "
+                    "VALUES (:order, 1, 'draft', '{}') RETURNING id"
+                ),
+                {"order": order_id},
+            )
+            plan_id = await connection.scalar(
+                text(
+                    "INSERT INTO order_plan_versions "
+                    "(order_id, version, status, content, requirements_version_id) "
+                    "VALUES (:order, 1, 'draft', '{}', :requirements) RETURNING id"
+                ),
+                {"order": order_id, "requirements": requirements_id},
+            )
+    finally:
+        await engine.dispose()
+    return {"order": order_id, "plan": plan_id}
+
+
+def _insert_section(url: str, ids: dict[str, int], index: int = 0, chars: int = 5) -> None:
+    asyncio.run(
+        _query(
+            url,
+            "INSERT INTO order_report_sections "
+            "(order_id, plan_version_id, section_index, content, char_count) "
+            'VALUES (:order, :plan, :index, \'{"paragraphs": ["Текст"], "subsections": []}\', '
+            ":chars)",
+            {**ids, "index": index, "chars": chars},
+        )
+    )
+
+
+def test_report_sections_migration_downgrade_and_upgrade(database_url: str) -> None:
+    config = make_alembic_config(database_url)
+    try:
+        ids = asyncio.run(_seed_plan(database_url))
+        assert asyncio.run(_query(database_url, REPORT_SECTION_TABLE)) == [
+            ("order_report_sections",)
+        ]
+        assert [
+            row[0] for row in asyncio.run(_query(database_url, REPORT_SECTION_CONSTRAINTS))
+        ] == [
+            "ck_order_report_sections_char_count_positive",
+            "ck_order_report_sections_section_index_non_negative",
+            "fk_order_report_sections_order_id_orders",
+            "fk_order_report_sections_plan_version_id_order_plan_versions",
+            "uq_order_report_sections_plan_version_id_section_index",
+        ]
+        assert [tuple(r) for r in asyncio.run(_query(database_url, CACHE_CREATION_COLUMN))] == [
+            ("integer", "NO", "0")
+        ]
+        _insert_section(database_url, ids)
+        asyncio.run(
+            _query(
+                database_url,
+                "INSERT INTO llm_calls (order_id, step, provider, model, status) "
+                "VALUES (:order, 'plan_generation', 'anthropic', 'm', 'success')",
+                {"order": ids["order"]},
+            )
+        )
+
+        command.downgrade(config, "0006")
+        assert asyncio.run(_query(database_url, REPORT_SECTION_TABLE)) == [(None,)]
+        assert asyncio.run(_query(database_url, CACHE_CREATION_COLUMN)) == []
+
+        command.upgrade(config, "head")
+        # Существующая строка llm_calls получила 0; таблица разделов пуста и рабочая.
+        rows = asyncio.run(
+            _query(
+                database_url,
+                f"SELECT cache_creation_tokens FROM llm_calls WHERE order_id IN ({SEEDED_ORDERS})",
+                {"base": COMMITTED_TG_ID_BASE},
+            )
+        )
+        assert [tuple(r) for r in rows] == [(0,)]
+        _insert_section(database_url, ids)
+    finally:
+        command.upgrade(config, "head")
+        # Строки llm_calls не удаляются вместе с заказом (SET NULL).
+        asyncio.run(
+            _query(
+                database_url,
+                f"DELETE FROM llm_calls WHERE order_id IN ({SEEDED_ORDERS})",
+                {"base": COMMITTED_TG_ID_BASE},
+            )
+        )
+        asyncio.run(_cleanup(database_url))
+
+
+@pytest.mark.parametrize(
+    ("index", "chars", "constraint"),
+    [
+        (0, 7, "uq_order_report_sections_plan_version_id_section_index"),
+        (-1, 5, "ck_order_report_sections_section_index_non_negative"),
+        (1, 0, "ck_order_report_sections_char_count_positive"),
+    ],
+)
+def test_report_section_constraints(
+    database_url: str, index: int, chars: int, constraint: str
+) -> None:
+    try:
+        ids = asyncio.run(_seed_plan(database_url))
+        _insert_section(database_url, ids)
+        with pytest.raises(Exception, match=constraint):
+            _insert_section(database_url, ids, index=index, chars=chars)
+    finally:
+        asyncio.run(_cleanup(database_url))
+
+
+def test_report_sections_deleted_with_order(database_url: str) -> None:
+    try:
+        ids = asyncio.run(_seed_plan(database_url))
+        _insert_section(database_url, ids)
+        asyncio.run(_cleanup(database_url))  # удаляет заказы: разделы — каскадом
+        count = "SELECT count(*) FROM order_report_sections WHERE order_id = :order"
+        assert asyncio.run(_query(database_url, count, {"order": ids["order"]})) == [(0,)]
+    finally:
+        asyncio.run(_cleanup(database_url))

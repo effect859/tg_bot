@@ -16,6 +16,7 @@ from app.services.material_processing import ProcessingOutcome
 from app.services.material_recovery import MaterialRecovery
 from app.services.periodic import PeriodicPass
 from app.services.plan_generation import PlanRecovery
+from app.services.report_generation import ReportGenerationRecovery
 from app.services.requirements_analysis import AnalysisOutcome, AnalysisRecovery
 from app.services.storage.base import FileStorage
 
@@ -61,6 +62,10 @@ def create_dispatcher(
         _run_while_polling(
             dispatcher,
             lambda bot: PlanRecovery(sessionmaker, llm_client, partial(notify_plan_outcome, bot)),
+        )
+        # Генерация текста отчёта: уведомлений пользователю на этом этапе нет.
+        _run_while_polling(
+            dispatcher, lambda bot: ReportGenerationRecovery(sessionmaker, llm_client)
         )
     return dispatcher
 

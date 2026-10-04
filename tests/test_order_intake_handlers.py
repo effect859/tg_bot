@@ -1358,6 +1358,6 @@ def test_dispatcher_registers_analysis_recovery_with_llm(
     with_llm = create_dispatcher(sessionmaker, MemoryStorage(), file_storage, None, llm)
 
     assert with_llm["llm_client"] is llm
-    # Два прохода восстановления: анализ материалов и составление плана.
-    assert len(with_llm.startup.handlers) == len(without.startup.handlers) + 2
-    assert len(with_llm.shutdown.handlers) == len(without.shutdown.handlers) + 2
+    # Три прохода восстановления: анализ материалов, составление плана, генерация отчёта.
+    assert len(with_llm.startup.handlers) == len(without.startup.handlers) + 3
+    assert len(with_llm.shutdown.handlers) == len(without.shutdown.handlers) + 3

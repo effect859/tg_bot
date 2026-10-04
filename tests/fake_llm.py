@@ -1,11 +1,11 @@
 """Подмена LLMClient для тестов: заданные ответы, без сети."""
 
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from app.domain.requirements import LLM_FIELDS
-from app.llm.base import LLMResult, LLMUsage, StopReason
+from app.llm.base import LLMResult, LLMUsage, PromptBlock, StopReason
 
 Answer = LLMResult | Exception | Callable[[], LLMResult]
 
@@ -29,6 +29,7 @@ class FakeLLMClient:
         max_tokens: int,
         model: str | None = None,
         json_schema: dict[str, Any] | None = None,
+        prefix: Sequence[PromptBlock] = (),
     ) -> LLMResult:
         self.calls.append(
             {
@@ -37,6 +38,7 @@ class FakeLLMClient:
                 "max_tokens": max_tokens,
                 "model": model,
                 "json_schema": json_schema,
+                "prefix": list(prefix),
             }
         )
         if self.on_complete is not None:
