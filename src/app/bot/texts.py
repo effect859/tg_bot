@@ -45,9 +45,9 @@ ORDER_STATUS_LABELS: dict[OrderStatus, str] = {
     OrderStatus.ANALYZING_MATERIALS: "анализ материалов",
     OrderStatus.WAITING_FOR_MISSING_DATA: "нужны данные",
     OrderStatus.WAITING_FOR_DATA_CONFIRMATION: "подтверждение данных",
-    # План в 2.8 ещё не строится: честно называем то, что уже сделано.
-    OrderStatus.PREPARING_PLAN: "ТЗ подтверждено",
-    OrderStatus.WAITING_FOR_PLAN_CONFIRMATION: "подтверждение плана",
+    OrderStatus.PREPARING_PLAN: "составляется план",
+    # Подтверждение плана — следующий этап: пока план только показан.
+    OrderStatus.WAITING_FOR_PLAN_CONFIRMATION: "план готов",
     OrderStatus.PAYMENT_PENDING: "ожидает оплаты",
     OrderStatus.PAID: "оплачен",
     OrderStatus.GENERATING: "генерируется",
@@ -64,6 +64,8 @@ FINISH_MATERIALS = "Материалы загружены"
 BTN_FINISH_MATERIALS = f"✅ {FINISH_MATERIALS}"
 RETRY_ANALYSIS = "Повторить анализ"
 BTN_RETRY_ANALYSIS = f"🔄 {RETRY_ANALYSIS}"
+RETRY_PLAN = "Повторить составление плана"
+BTN_RETRY_PLAN = f"🔄 {RETRY_PLAN}"
 
 MAX_MATERIAL_SIZE_MIB = MAX_MATERIAL_SIZE_BYTES // (1024 * 1024)
 # Сколько символов имени файла показываем в ответах.
@@ -245,6 +247,32 @@ SUMMARY_OPTIONAL_FIELDS: tuple[str, ...] = (
 # Сколько символов значения показывать в подтверждении ответа.
 ANSWER_PREVIEW_LENGTH = 200
 
+# --- План отчёта --------------------------------------------------------------------
+
+PLAN_STARTED = "🗂 Составляю план отчёта — это может занять пару минут."
+PLAN_DELAYED = (
+    "⏳ План не удалось составить с первой попытки. Повторим автоматически и сообщим результат."
+)
+PLAN_LIMIT_REACHED = (
+    "Лимит попыток составления плана исчерпан. Отмените заказ, чтобы оформить новый."
+)
+PLAN_UNAVAILABLE = "Составление плана сейчас недоступно. Попробуйте позже."
+PLAN_SHOW_FAILED = "Не удалось показать план из-за технической ошибки. Попробуйте позже."
+PLAN_ACTION_FAILED = "Не удалось выполнить действие из-за технической ошибки. Попробуйте ещё раз."
+PLAN_NEXT_STEP = (
+    "Следующий шаг — подтверждение плана и оплата: они пока недоступны. Заказ можно отменить."
+)
+PLAN_SHORTENED = "<i>План показан сокращённо.</i>"
+# Шаги сокращения плана: (символов в названии раздела, в описании, требований,
+# символов в требовании, подразделов, символов в названии подраздела).
+PLAN_VIEW_LIMITS: tuple[tuple[int, int, int, int, int, int], ...] = (
+    (200, 300, 10, 200, 10, 200),
+    (150, 150, 3, 120, 10, 120),
+    (100, 0, 0, 0, 10, 80),
+    (80, 0, 0, 0, 3, 60),
+    (30, 0, 0, 0, 0, 0),
+)
+
 NO_ORDERS = "У вас пока нет заказов."
 
 HELP = (
@@ -389,8 +417,79 @@ def answer_accepted(field: str, value: str) -> str:
     return f"✅ Записал: {REQUIREMENT_LABELS.get(field, field)} — {shown}."
 
 
-def requirements_confirmed_state(order_id: int) -> str:
-    return f"Заказ #{order_id}: {REQUIREMENTS_CONFIRMED}"
+def plan_in_progress(order_id: int) -> str:
+    return (
+        f"Заказ #{order_id}: ТЗ подтверждено, составляю план отчёта. Сообщу, когда он будет готов."
+    )
+
+
+def plan_failed(order_id: int, *, can_retry: bool) -> str:
+    text = f"❌ Не удалось составить план отчёта по заказу #{order_id}."
+    if can_retry:
+        return f"{text} Нажмите «{RETRY_PLAN}» или отмените заказ."
+    return f"{text} {PLAN_LIMIT_REACHED}"
+
+
+def plan_already_restarted(order: Order) -> str:
+    return f"План отчёта по заказу #{order.id} уже составляется."
+
+
+def plan_view(order_id: int, plan: dict[str, object]) -> str:
+    """План для пользователя: разделы, подразделы, объём — экранировано, ≤ 4096 символов.
+
+    Длинный план сокращается по шагам PLAN_VIEW_LIMITS (длина проверяется уже
+    после экранирования); последний шаг укладывается при любом допустимом плане.
+    """
+    text = ""
+    for step, limits in enumerate(PLAN_VIEW_LIMITS):
+        text = _render_plan(order_id, plan, limits, shortened=step > 0)
+        if len(text) <= MAX_MESSAGE_CHARS:
+            break
+    return text
+
+
+def _render_plan(
+    order_id: int,
+    plan: dict[str, object],
+    limits: tuple[int, int, int, int, int, int],
+    *,
+    shortened: bool,
+) -> str:
+    title_len, desc_len, max_reqs, req_len, max_subs, sub_len = limits
+    lines = [f"🗂 <b>План отчёта — заказ #{order_id}</b>"]
+    total = plan.get("total_pages")
+    if isinstance(total, int):
+        lines.append(f"Объём: {total} стр.")
+    sections = plan.get("sections")
+    for number, section in enumerate(sections if isinstance(sections, list) else [], start=1):
+        lines.append("")
+        lines.append(
+            f"<b>{number}. {_preview(str(section.get('title', '')), title_len)}</b>"
+            f"{_pages_suffix(section.get('target_pages'))}"
+        )
+        description = str(section.get("description") or "")
+        if desc_len and description:
+            lines.append(_preview(description, desc_len))
+        requirements = section.get("requirements") or []
+        if max_reqs:
+            lines += [f"• {_preview(str(item), req_len)}" for item in requirements[:max_reqs]]
+        subsections = section.get("subsections") or []
+        for sub_number, sub in enumerate(subsections[:max_subs], start=1):
+            lines.append(
+                f"   {number}.{sub_number}. {_preview(str(sub.get('title', '')), sub_len)}"
+                f"{_pages_suffix(sub.get('target_pages'))}"
+            )
+        if len(subsections) > max_subs:
+            lines.append(f"   подразделов: {len(subsections)}")
+    lines.append("")
+    if shortened:
+        lines.append(PLAN_SHORTENED)
+    lines.append(PLAN_NEXT_STEP)
+    return "\n".join(lines)
+
+
+def _pages_suffix(pages: object) -> str:
+    return f" — {pages} стр." if isinstance(pages, int) and not isinstance(pages, bool) else ""
 
 
 def requirements_summary(order_id: int, content: dict[str, object]) -> str:

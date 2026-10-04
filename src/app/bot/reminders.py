@@ -17,11 +17,14 @@ from app.bot.keyboards import (
     confirmation_keyboard,
     consent_keyboard,
     materials_keyboard,
+    plan_failed_keyboard,
 )
 from app.db.models import Order
 from app.domain.enums import OrderStatus
 from app.domain.errors import VersionNotFoundError
+from app.domain.plan import MAX_PLAN_LLM_CALLS
 from app.domain.requirements import MAX_ANALYSIS_LLM_CALLS
+from app.services.plan_generation import count_plan_calls, get_plan_draft
 from app.services.requirements_analysis import count_analysis_calls
 from app.services.requirements_dialog import RequirementsDialog, get_dialog
 
@@ -65,8 +68,23 @@ async def active_order_reminder(session: AsyncSession, order: Order) -> Reply:
                 return texts.REQUIREMENTS_UNAVAILABLE, cancel_order_keyboard(order_id)
             return dialog_message(dialog)
         case S.PREPARING_PLAN:
-            # План ещё не строится; заказ можно отменить.
-            return texts.requirements_confirmed_state(order.id), cancel_order_keyboard(order.id)
+            return texts.plan_in_progress(order.id), cancel_order_keyboard(order.id)
+        case S.FAILED if order.failed_from_status is S.PREPARING_PLAN:
+            calls = await count_plan_calls(session, order.id)
+            can_retry = calls < MAX_PLAN_LLM_CALLS
+            return (
+                texts.plan_failed(order.id, can_retry=can_retry),
+                plan_failed_keyboard(order.id, can_retry=can_retry),
+            )
+        case S.WAITING_FOR_PLAN_CONFIRMATION:
+            # Подтверждения плана пока нет: показываем план, заказ можно отменить.
+            order_id = order.id
+            plan = await get_plan_draft(session, order_id)
+            if plan is None:
+                # Нарушение целостности: шаг плана без черновика плана.
+                logger.error("Plan draft missing: order_id=%s", order_id)
+                return texts.PLAN_SHOW_FAILED, cancel_order_keyboard(order_id)
+            return texts.plan_view(order_id, plan), cancel_order_keyboard(order_id)
         case _:
             return texts.active_order_exists(order), None
 

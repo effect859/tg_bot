@@ -140,6 +140,15 @@ class AnalysisLimitReachedError(OrderDomainError):
         self.limit = limit
 
 
+class PlanLimitReachedError(OrderDomainError):
+    """Исчерпан лимит вызовов модели на составление плана заказа."""
+
+    def __init__(self, order_id: int, limit: int) -> None:
+        super().__init__(f"Order {order_id}: plan LLM call limit of {limit} reached")
+        self.order_id = order_id
+        self.limit = limit
+
+
 class RequirementFieldNotEditableError(OrderDomainError):
     """Поле ТЗ нельзя изменить из диалога: редактируются только обязательные поля."""
 

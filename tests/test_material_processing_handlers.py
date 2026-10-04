@@ -15,7 +15,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot import texts
-from app.bot.handlers import menu, order_intake, requirements_dialog, start
+from app.bot.handlers import menu, order_intake, plan, requirements_dialog, start
 from app.bot.handlers.order_intake import receive_document
 from app.bot.setup import create_dispatcher
 from app.db.models import User
@@ -261,7 +261,13 @@ def test_dispatcher_provides_text_extractor(
 ) -> None:
     # Роутеры — глобальные объекты и подключаются только к одному диспетчеру;
     # другие тесты уже могли создать свой. Связь восстанавливается после теста.
-    for router in (start.router, menu.router, order_intake.router, requirements_dialog.router):
+    for router in (
+        start.router,
+        menu.router,
+        order_intake.router,
+        plan.router,
+        requirements_dialog.router,
+    ):
         monkeypatch.setattr(router, "_parent_router", None)
     extractor = FakeExtractor()
     dispatcher = create_dispatcher(sessionmaker, MemoryStorage(), file_storage, extractor)
@@ -270,7 +276,13 @@ def test_dispatcher_provides_text_extractor(
 
 
 def _detach_routers(monkeypatch: pytest.MonkeyPatch) -> None:
-    for router in (start.router, menu.router, order_intake.router, requirements_dialog.router):
+    for router in (
+        start.router,
+        menu.router,
+        order_intake.router,
+        plan.router,
+        requirements_dialog.router,
+    ):
         monkeypatch.setattr(router, "_parent_router", None)
 
 

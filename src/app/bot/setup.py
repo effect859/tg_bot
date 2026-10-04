@@ -6,14 +6,16 @@ from aiogram.fsm.storage.base import BaseStorage
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot import texts
-from app.bot.handlers import menu, order_intake, requirements_dialog, start
+from app.bot.handlers import menu, order_intake, plan, requirements_dialog, start
 from app.bot.middlewares.db import DbSessionMiddleware
 from app.bot.middlewares.user import UserMiddleware
+from app.domain.plan import PlanOutcome
 from app.extraction.base import TextExtractor
 from app.llm.base import LLMClient
 from app.services.material_processing import ProcessingOutcome
 from app.services.material_recovery import MaterialRecovery
 from app.services.periodic import PeriodicPass
+from app.services.plan_generation import PlanRecovery
 from app.services.requirements_analysis import AnalysisOutcome, AnalysisRecovery
 from app.services.storage.base import FileStorage
 
@@ -40,7 +42,7 @@ def create_dispatcher(
     # Роутер уточнения ТЗ — последним: его хендлер обычного текста не должен
     # перехватывать команды, кнопки меню и документы.
     dispatcher.include_routers(
-        start.router, menu.router, order_intake.router, requirements_dialog.router
+        start.router, menu.router, order_intake.router, plan.router, requirements_dialog.router
     )
     if text_extractor is not None:
         _run_while_polling(
@@ -55,6 +57,10 @@ def create_dispatcher(
             lambda bot: AnalysisRecovery(
                 sessionmaker, llm_client, partial(notify_analysis_outcome, bot)
             ),
+        )
+        _run_while_polling(
+            dispatcher,
+            lambda bot: PlanRecovery(sessionmaker, llm_client, partial(notify_plan_outcome, bot)),
         )
     return dispatcher
 
@@ -90,6 +96,14 @@ async def notify_material_outcome(bot: Bot, chat_id: int, outcome: ProcessingOut
 async def notify_analysis_outcome(bot: Bot, chat_id: int, outcome: AnalysisOutcome) -> None:
     """Сообщение пользователю об исходе фонового анализа материалов."""
     reply = order_intake.analysis_reply(outcome)
+    if reply is not None:
+        text, markup = reply
+        await bot.send_message(chat_id, text, reply_markup=markup)
+
+
+async def notify_plan_outcome(bot: Bot, chat_id: int, outcome: PlanOutcome) -> None:
+    """Сообщение пользователю об исходе фонового составления плана."""
+    reply = plan.plan_reply(outcome)
     if reply is not None:
         text, markup = reply
         await bot.send_message(chat_id, text, reply_markup=markup)

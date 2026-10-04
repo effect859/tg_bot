@@ -23,7 +23,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot import texts
-from app.bot.handlers import menu, order_intake, requirements_dialog, start
+from app.bot.handlers import menu, order_intake, plan, requirements_dialog, start
 from app.bot.handlers.order_intake import (
     cancel_order,
     finish_order_materials,
@@ -1342,7 +1342,13 @@ def test_dispatcher_registers_analysis_recovery_with_llm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def detach() -> None:
-        for router in (start.router, menu.router, order_intake.router, requirements_dialog.router):
+        for router in (
+            start.router,
+            menu.router,
+            order_intake.router,
+            plan.router,
+            requirements_dialog.router,
+        ):
             monkeypatch.setattr(router, "_parent_router", None)
 
     detach()
@@ -1352,5 +1358,6 @@ def test_dispatcher_registers_analysis_recovery_with_llm(
     with_llm = create_dispatcher(sessionmaker, MemoryStorage(), file_storage, None, llm)
 
     assert with_llm["llm_client"] is llm
-    assert len(with_llm.startup.handlers) == len(without.startup.handlers) + 1
-    assert len(with_llm.shutdown.handlers) == len(without.shutdown.handlers) + 1
+    # Два прохода восстановления: анализ материалов и составление плана.
+    assert len(with_llm.startup.handlers) == len(without.startup.handlers) + 2
+    assert len(with_llm.shutdown.handlers) == len(without.shutdown.handlers) + 2

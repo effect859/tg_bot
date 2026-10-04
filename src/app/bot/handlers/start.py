@@ -13,13 +13,14 @@ from app.services.orders import get_active_order
 
 router = Router(name="start")
 
-# Шаги, в которых бот ждёт от пользователя ответа или решения по ТЗ: после /start
-# (в том числе после рестарта бота) о них напоминаем сразу.
+# Шаги, в которых бот ждёт от пользователя ответа или решения по ТЗ и плану: после
+# /start (в том числе после рестарта бота) о них напоминаем сразу.
 START_REMINDER_STATUSES = frozenset(
     {
         OrderStatus.WAITING_FOR_MISSING_DATA,
         OrderStatus.WAITING_FOR_DATA_CONFIRMATION,
         OrderStatus.PREPARING_PLAN,
+        OrderStatus.WAITING_FOR_PLAN_CONFIRMATION,
     }
 )
 

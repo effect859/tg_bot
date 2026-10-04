@@ -23,7 +23,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot import texts
-from app.bot.handlers import menu, order_intake, requirements_dialog, start
+from app.bot.handlers import menu, order_intake, plan, requirements_dialog, start
 from app.bot.handlers.order_intake import analysis_reply, cancel_order, new_report
 from app.bot.handlers.requirements_dialog import (
     answer_requirement,
@@ -337,7 +337,7 @@ async def test_text_after_confirmation_shows_honest_state(session: AsyncSession)
 
     await answer_requirement(message, session, user)
 
-    assert _answers(message) == [texts.requirements_confirmed_state(order_id)]
+    assert _answers(message) == [texts.plan_in_progress(order_id)]
     assert _req_actions(_markups(message)[0]) == ["cancel"]
 
 
@@ -650,7 +650,7 @@ async def test_start_after_confirmation(session: AsyncSession) -> None:
 
     await cmd_start(message, AsyncMock(), user, session)
 
-    assert _answers(message)[1] == texts.requirements_confirmed_state(order_id)
+    assert _answers(message)[1] == texts.plan_in_progress(order_id)
     assert _req_actions(_markups(message)[1]) == ["cancel"]
 
 
@@ -693,7 +693,8 @@ def test_analysis_result_asks_first_question() -> None:
 
 
 def test_my_orders_label_for_confirmed_requirements() -> None:
-    assert texts.status_label(S.PREPARING_PLAN) == "ТЗ подтверждено"
+    # С 2.9 план после подтверждения ТЗ действительно составляется.
+    assert texts.status_label(S.PREPARING_PLAN) == "составляется план"
 
 
 # --- Маршрутизация через Dispatcher ------------------------------------------------
@@ -734,7 +735,13 @@ def make_dispatcher(
 ) -> Callable[[], Dispatcher]:
     def make() -> Dispatcher:
         # Роутер подключается к одному диспетчеру: отцепляем от предыдущего.
-        for router in (start.router, menu.router, order_intake.router, requirements_dialog.router):
+        for router in (
+            start.router,
+            menu.router,
+            order_intake.router,
+            plan.router,
+            requirements_dialog.router,
+        ):
             monkeypatch.setattr(router, "_parent_router", None)
         return create_dispatcher(sessionmaker, MemoryStorage(), LocalFileStorage(tmp_path))
 

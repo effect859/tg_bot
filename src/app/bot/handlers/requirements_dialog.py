@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot import texts
 from app.bot.handlers.order_intake import _remove_keyboard, _rollback_quietly, _send
+from app.bot.handlers.plan import run_plan
 from app.bot.keyboards import (
     RequirementsAction,
     RequirementsCallback,
@@ -36,6 +37,7 @@ from app.domain.errors import (
     RequirementsChangedError,
     VersionNotFoundError,
 )
+from app.llm.base import LLMClient
 from app.services.orders import get_active_order, get_user_order
 from app.services.requirements_dialog import (
     AnswerOutcome,
@@ -155,11 +157,13 @@ async def confirm_requirements_button(
     session: AsyncSession,
     user: User,
     bot: Bot,
+    llm_client: LLMClient | None = None,
 ) -> None:
-    """«Подтвердить ТЗ»: WAITING_FOR_DATA_CONFIRMATION -> PREPARING_PLAN.
+    """«Подтвердить ТЗ»: WAITING_FOR_DATA_CONFIRMATION -> PREPARING_PLAN, затем план.
 
     Под блокировкой заказа: двойное нажатие упирается в статус, кнопка под
-    устаревшим резюме — в отпечаток содержимого.
+    устаревшим резюме — в отпечаток содержимого. План составляется в этом же
+    апдейте, если подключён LLM-клиент; иначе заказ ждёт прохода восстановления.
     """
     try:
         order = await get_user_order(session, user.id, callback_data.order_id)
@@ -195,8 +199,12 @@ async def confirm_requirements_button(
         return
     await callback.answer()
     await _remove_keyboard(callback, bot)
-    # Отменить заказ можно и после подтверждения: план ещё не оплачен.
-    await _send(callback, bot, texts.REQUIREMENTS_CONFIRMED, cancel_order_keyboard(order_id))
+    if llm_client is None:
+        # Отменить заказ можно и после подтверждения: план ещё не оплачен.
+        await _send(callback, bot, texts.REQUIREMENTS_CONFIRMED, cancel_order_keyboard(order_id))
+        return
+    await _send(callback, bot, texts.REQUIREMENTS_CONFIRMED)
+    await run_plan(callback, bot, session, llm_client, order_id)
 
 
 @router.callback_query(RequirementsCallback.filter(F.action == RequirementsAction.EDIT))
