@@ -6,6 +6,7 @@
 версии плана.
 """
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from fractions import Fraction
@@ -87,6 +88,8 @@ _PAGES = {
     "description": "Примерный объём в страницах или null.",
 }
 
+_TITLE_DESCRIPTION = "Название без номера: нумерацию разделов добавляет система."
+
 # Два уровня (раздел и подраздел) без рекурсии. Количество и длины в схеме не
 # задаются — structured outputs их не поддерживают; их проверяет validate_plan.
 PLAN_JSON_SCHEMA: dict[str, Any] = _object(
@@ -96,7 +99,7 @@ PLAN_JSON_SCHEMA: dict[str, Any] = _object(
             "description": f"Разделы отчёта по порядку: от {MIN_SECTIONS} до {MAX_SECTIONS}.",
             "items": _object(
                 {
-                    "title": {"type": "string", "description": "Название раздела."},
+                    "title": {"type": "string", "description": _TITLE_DESCRIPTION},
                     "description": {
                         "type": "string",
                         "description": "Что раскрыть в разделе (кратко).",
@@ -112,7 +115,7 @@ PLAN_JSON_SCHEMA: dict[str, Any] = _object(
                         "description": f"Подразделы, до {MAX_SUBSECTIONS}; без вложенности.",
                         "items": _object(
                             {
-                                "title": {"type": "string"},
+                                "title": {"type": "string", "description": _TITLE_DESCRIPTION},
                                 "description": {"type": "string"},
                                 "target_pages": _PAGES,
                             }
@@ -180,7 +183,7 @@ def _section(item: Any) -> dict[str, Any]:
     subs = [_subsection(sub) for sub in subsections]
     _check_unique([s["title"] for s in subs], "subsection")
     return {
-        "title": _text(item["title"], 1, MAX_TITLE_CHARS),
+        "title": _title(item["title"]),
         "description": _text(item["description"], 0, MAX_DESCRIPTION_CHARS),
         "requirements": [_text(r, 1, MAX_REQUIREMENT_CHARS) for r in requirements],
         "target_pages": _pages(item["target_pages"]),
@@ -192,7 +195,7 @@ def _subsection(item: Any) -> dict[str, Any]:
     if not isinstance(item, dict) or set(item) != {"title", "description", "target_pages"}:
         raise InvalidPlanResponse("subsection has unexpected structure")
     return {
-        "title": _text(item["title"], 1, MAX_TITLE_CHARS),
+        "title": _title(item["title"]),
         "description": _text(item["description"], 0, MAX_DESCRIPTION_CHARS),
         "requirements": [],
         "target_pages": _pages(item["target_pages"]),
@@ -207,6 +210,42 @@ def _text(value: Any, min_chars: int, max_chars: int) -> str:
     if not min_chars <= len(text) <= max_chars or not text.isprintable():
         raise InvalidPlanResponse("text field length or characters invalid")
     return text
+
+
+# Номер в начале названия: «1.», «1)», «1.2.», «1.2» — только арабские цифры ASCII.
+_NUMBERING = re.compile(r"([0-9]+(?:\.[0-9]+)*)([.)]?)(\s*)")
+
+
+def _title(value: Any) -> str:
+    """Название раздела или подраздела без номера: нумерацию добавляет система.
+
+    Номер, который модель всё же поставила, убирается до проверки уникальности;
+    если от названия ничего не осталось, срабатывает обычная проверка длины.
+    """
+    return _text(_strip_numbering(_text(value, 1, MAX_TITLE_CHARS)), 1, MAX_TITLE_CHARS)
+
+
+def _strip_numbering(title: str) -> str:
+    """Убирает номер раздела в начале названия, не трогая числа в самом тексте.
+
+    Номером считается:
+    * число или «1.2» с точкой или скобкой в конце, за которыми пробел, конец строки
+      или заглавная буква: «1. Введение», «1) Введение», «1.2. Структура», «1.Введение»;
+    * многоуровневый номер без точки в конце, за которым пробел и заглавная буква:
+      «1.2 Структура».
+    Не номер: «2024 год», «ISO 9001», «3D-модель», «5S-система», «3.5 млн».
+    """
+    match = _NUMBERING.match(title)
+    if match is None:
+        return title
+    number, closer, space = match.groups()
+    rest = title[match.end() :]
+    starts_upper = rest[:1].isupper()
+    if closer and (space or not rest or starts_upper):
+        return rest
+    if not closer and "." in number and space and starts_upper:
+        return rest
+    return title
 
 
 def _pages(value: Any) -> int | None:
