@@ -17,6 +17,7 @@ from app.bot.keyboards import (
     confirmation_keyboard,
     consent_keyboard,
     materials_keyboard,
+    plan_confirmation_keyboard,
     plan_failed_keyboard,
 )
 from app.db.models import Order
@@ -24,6 +25,7 @@ from app.domain.enums import OrderStatus
 from app.domain.errors import VersionNotFoundError
 from app.domain.plan import MAX_PLAN_LLM_CALLS
 from app.domain.requirements import MAX_ANALYSIS_LLM_CALLS
+from app.domain.requirements_dialog import content_digest
 from app.services.plan_generation import count_plan_calls, get_plan_draft
 from app.services.requirements_analysis import count_analysis_calls
 from app.services.requirements_dialog import RequirementsDialog, get_dialog
@@ -77,14 +79,17 @@ async def active_order_reminder(session: AsyncSession, order: Order) -> Reply:
                 plan_failed_keyboard(order.id, can_retry=can_retry),
             )
         case S.WAITING_FOR_PLAN_CONFIRMATION:
-            # Подтверждения плана пока нет: показываем план, заказ можно отменить.
             order_id = order.id
             plan = await get_plan_draft(session, order_id)
             if plan is None:
                 # Нарушение целостности: шаг плана без черновика плана.
                 logger.error("Plan draft missing: order_id=%s", order_id)
                 return texts.PLAN_SHOW_FAILED, cancel_order_keyboard(order_id)
-            return texts.plan_view(order_id, plan), cancel_order_keyboard(order_id)
+            markup = plan_confirmation_keyboard(order_id, content_digest(plan))
+            return texts.plan_view(order_id, plan), markup
+        case S.PAYMENT_PENDING:
+            # Оплаты пока нет: заказ можно только отменить.
+            return texts.payment_pending(order.id), cancel_order_keyboard(order.id)
         case _:
             return texts.active_order_exists(order), None
 

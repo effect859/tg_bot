@@ -47,6 +47,23 @@ class RequirementsCallback(CallbackData, prefix="req"):
     digest: str = ""
 
 
+class PlanAction(StrEnum):
+    CONFIRM = "confirm"
+
+
+class PlanCallback(CallbackData, prefix="plan"):
+    """Кнопка экрана плана. Всё приходит от клиента: владельца и статус проверяет
+    хендлер и сервис.
+
+    ``digest`` — отпечаток плана на экране: «Подтвердить» под устаревшим планом не
+    подтвердит изменившийся с тех пор план.
+    """
+
+    action: PlanAction
+    order_id: int
+    digest: str = ""
+
+
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -95,6 +112,17 @@ def plan_failed_keyboard(order_id: int, *, can_retry: bool) -> InlineKeyboardMar
     if can_retry:
         rows.insert(0, [_order_button(texts.BTN_RETRY_PLAN, OrderAction.RETRY_PLAN, order_id)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def plan_confirmation_keyboard(order_id: int, digest: str) -> InlineKeyboardMarkup:
+    """Экран плана: подтвердить план или отменить заказ."""
+    confirm = PlanCallback(action=PlanAction.CONFIRM, order_id=order_id, digest=digest)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=texts.BTN_CONFIRM_PLAN, callback_data=confirm.pack())],
+            [_order_button(texts.BTN_CANCEL_ORDER, OrderAction.CANCEL, order_id)],
+        ]
+    )
 
 
 def _requirements_button(

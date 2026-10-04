@@ -30,7 +30,13 @@ from app.bot.handlers.order_intake import cancel_order, new_report
 from app.bot.handlers.plan import plan_reply, retry_plan
 from app.bot.handlers.requirements_dialog import answer_requirement, confirm_requirements_button
 from app.bot.handlers.start import cmd_start
-from app.bot.keyboards import OrderAction, OrderCallback, RequirementsAction, RequirementsCallback
+from app.bot.keyboards import (
+    OrderAction,
+    OrderCallback,
+    PlanCallback,
+    RequirementsAction,
+    RequirementsCallback,
+)
 from app.bot.reminders import active_order_reminder
 from app.bot.setup import create_dispatcher, notify_plan_outcome
 from app.db.models import LLMCall, Order, OrderPlanVersion, User
@@ -85,11 +91,14 @@ def _answers(message: AsyncMock) -> list[str]:
 
 def _actions(markup: Any) -> list[str]:
     assert isinstance(markup, InlineKeyboardMarkup)
-    return [
-        OrderCallback.unpack(b.callback_data).action.value  # type: ignore[arg-type]
-        for row in markup.inline_keyboard
-        for b in row
-    ]
+    actions = []
+    for row in markup.inline_keyboard:
+        for button in row:
+            data = button.callback_data
+            assert data is not None
+            callback_type = PlanCallback if data.startswith("plan:") else OrderCallback
+            actions.append(callback_type.unpack(data).action.value)
+    return actions
 
 
 def _alert(callback: AsyncMock) -> str:
@@ -158,7 +167,7 @@ async def test_confirm_requirements_generates_and_shows_plan(session: AsyncSessi
     assert (confirmed, started) == (texts.REQUIREMENTS_CONFIRMED, texts.PLAN_STARTED)
     assert shown.startswith(f"🗂 <b>План отчёта — заказ #{order_id}</b>")
     assert "Введение" in shown and texts.PLAN_NEXT_STEP in shown
-    assert _actions(_last_markup(bot)) == ["cancel"]  # подтверждения плана пока нет
+    assert _actions(_last_markup(bot)) == ["confirm", "cancel"]
     assert (await fresh_order(session, order_id)).status is S.WAITING_FOR_PLAN_CONFIRMATION
     assert await _plans(session, order_id) == 1
     assert len(llm.calls) == 1
@@ -473,7 +482,7 @@ async def test_notify_plan_outcome_sends_plan() -> None:
 
     chat_id, text = bot.send_message.await_args.args
     assert chat_id == 42 and text.startswith("🗂 <b>План отчёта — заказ #5</b>")
-    assert _actions(bot.send_message.await_args.kwargs["reply_markup"]) == ["cancel"]
+    assert _actions(bot.send_message.await_args.kwargs["reply_markup"]) == ["confirm", "cancel"]
 
 
 # --- Напоминания, /start, «Новый отчёт», текст, отмена ----------------------------------
@@ -494,7 +503,7 @@ async def test_reminder_shows_ready_plan(session: AsyncSession) -> None:
     text, markup = await active_order_reminder(session, await fresh_order(session, order_id))
 
     assert text.startswith(f"🗂 <b>План отчёта — заказ #{order_id}</b>")
-    assert _actions(markup) == ["cancel"]
+    assert _actions(markup) == ["confirm", "cancel"]
 
 
 async def test_reminder_without_plan_draft(

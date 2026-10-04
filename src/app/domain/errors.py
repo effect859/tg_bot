@@ -165,6 +165,14 @@ class RequirementsChangedError(OrderDomainError):
         self.order_id = order_id
 
 
+class PlanChangedError(OrderDomainError):
+    """План изменился после того, как пользователь его увидел: подтверждать нечего."""
+
+    def __init__(self, order_id: int) -> None:
+        super().__init__(f"Order {order_id}: plan changed since it was shown")
+        self.order_id = order_id
+
+
 class MaterialNotFoundError(OrderDomainError):
     def __init__(self, material_id: int) -> None:
         super().__init__(f"Material {material_id} not found")
