@@ -6,6 +6,7 @@
 
 import inspect
 import io
+import posixpath
 import time
 import tracemalloc
 import zipfile
@@ -516,3 +517,199 @@ def _all_paragraphs(section: Section) -> list[str]:
     for subsection in section.subsections:
         paragraphs += _all_paragraphs(subsection)
     return paragraphs
+
+
+# --- Возможности рендерера: титульный лист и литература (Stage 3.3) ----------------------
+
+
+@pytest.mark.parametrize(
+    ("capability", "code"),
+    [
+        ({"title_page": {"student_name": "Иванов Иван"}}, DocumentErrorCode.TITLE_PAGE_UNSUPPORTED),
+        ({"references": ["Источник."]}, DocumentErrorCode.REFERENCES_UNSUPPORTED),
+    ],
+    ids=["title-page", "references"],
+)
+def test_unsupported_capabilities_rejected_before_rendering(
+    monkeypatch: pytest.MonkeyPatch, capability: dict[str, Any], code: DocumentErrorCode
+) -> None:
+    """Данные валидны для домена, но рендерер их не поддерживает: отказ до Document()."""
+
+    def no_document() -> None:
+        raise AssertionError("rendering started before capability check")
+
+    monkeypatch.setattr(docx_module, "Document", no_document)
+    content = DocumentContent(
+        doc_type=DocType.PRACTICE_REPORT,
+        title="t",
+        sections=[Section(title="Р", paragraphs=["т"])],
+        **capability,
+    )
+    docx_module.validate_document_content(content)  # домен такие данные принимает
+
+    with pytest.raises(InvalidDocumentError) as caught:
+        PracticeReportDocxRenderer().render(content)
+
+    assert caught.value.code is code
+
+
+def test_capability_checked_before_document_validation() -> None:
+    """Порядок: doc_type → возможности рендерера → проверка документа."""
+    content = DocumentContent(
+        doc_type=DocType.PRACTICE_REPORT,
+        title="t",
+        title_page={"student_name": "Иванов"},
+        sections=[Section(title="Р", paragraphs=["до\x00после"])],
+    )
+
+    with pytest.raises(InvalidDocumentError) as caught:
+        _render(content)
+
+    assert caught.value.code is DocumentErrorCode.TITLE_PAGE_UNSUPPORTED
+
+
+# --- Стили оглавления toc 1 / toc 2 (Stage 3.3) ------------------------------------------
+
+
+def _style_by_name(package: Package, name: str) -> Any:
+    [style] = package.xml("word/styles.xml").xpath(
+        f'w:style[w:name/@w:val="{name}"]', namespaces=NS
+    )
+    return style
+
+
+def _twips_from_cm(cm: float) -> int:
+    return round(cm / 2.54 * 1440)
+
+
+@pytest.mark.parametrize(
+    ("level", "left_indent"),
+    [(1, "0"), (2, str(_twips_from_cm(GOST_7_32.toc_level_indent_cm)))],
+)
+def test_toc_styles(level: int, left_indent: str) -> None:
+    style = _style_by_name(Package(_render()), f"toc {level}")
+
+    assert style.get(_w("type")) == "paragraph"
+    assert style.get(_w("customStyle")) is None  # встроенный стиль Word
+    assert _attr(style, "w:basedOn", "val") == "Normal"
+    assert _attr(style, "w:pPr/w:ind", "firstLine") == "0"
+    assert _attr(style, "w:pPr/w:ind", "left") == left_indent
+    assert _attr(style, "w:pPr/w:jc", "val") == "left"
+    [tab] = style.findall("w:pPr/w:tabs/w:tab", NS)
+    assert (tab.get(_w("val")), tab.get(_w("leader"))) == ("right", "dot")
+    assert tab.get(_w("pos")) == str(_twips_from_mm(GOST_7_32.text_width_mm)) == "9354"
+    # Шрифт, размер и интервал — от Normal: своих rFonts, тем и размеров нет.
+    assert style.find("w:rPr", NS) is None
+
+
+def test_toc_level_two_indent_constant() -> None:
+    assert GOST_7_32.toc_level_indent_cm == 1.25
+    assert _twips_from_cm(1.25) == 709
+    assert GOST_7_32.text_width_mm == 210 - 30 - 15
+
+
+def test_toc_styles_defined_once() -> None:
+    styles = Package(_render()).xml("word/styles.xml")
+    names = styles.xpath("w:style/w:name/@w:val", namespaces=NS)
+
+    assert names.count("toc 1") == 1 and names.count("toc 2") == 1
+    assert "toc 3" not in names
+
+
+# --- Пакет без артефактов шаблона (Stage 3.3) ---------------------------------------------
+
+PACKAGE_PARTS = {
+    "[Content_Types].xml",
+    "_rels/.rels",
+    "docProps/core.xml",
+    "word/document.xml",
+    "word/_rels/document.xml.rels",
+    "word/styles.xml",
+    "word/settings.xml",
+    "word/webSettings.xml",
+    "word/fontTable.xml",
+    "word/theme/theme1.xml",
+    "word/numbering.xml",
+    "word/footer1.xml",
+}
+PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+CONTENT_TYPES = "http://schemas.openxmlformats.org/package/2006/content-types"
+
+
+def test_package_parts_allowlist() -> None:
+    """Точный состав пакета: изменение шаблона python-docx не пройдёт незамеченным."""
+    assert set(Package(_render()).zip.namelist()) == PACKAGE_PARTS
+
+
+def _relationships(package: Package) -> list[tuple[str, str, str]]:
+    """(часть-источник, тип, часть-цель) для всех внутренних связей пакета."""
+    found = []
+    for name in package.zip.namelist():
+        if not name.endswith(".rels"):
+            continue
+        directory, rels_file = posixpath.split(name)
+        source_directory = posixpath.dirname(directory)  # word/_rels → word
+        source = posixpath.join(source_directory, rels_file.removesuffix(".rels"))
+        for rel in package.xml(name).findall(f"{{{PKG_REL}}}Relationship"):
+            if rel.get("TargetMode") == "External":
+                continue
+            target = posixpath.normpath(posixpath.join(source_directory, rel.get("Target")))
+            found.append((source, rel.get("Type"), target))
+    return found
+
+
+def test_no_dangling_or_orphan_parts() -> None:
+    package = Package(_render())
+    names = set(package.zip.namelist())
+    relationships = _relationships(package)
+
+    targets = {target for _, _, target in relationships}
+    assert targets <= names  # нет связей на отсутствующие части
+    content_parts = {n for n in names if not n.endswith(".rels") and n != "[Content_Types].xml"}
+    assert content_parts == targets  # и нет частей, на которые никто не ссылается
+
+
+def test_content_types_match_parts() -> None:
+    package = Package(_render())
+    types = package.xml("[Content_Types].xml")
+    defaults = {d.get("Extension") for d in types.findall(f"{{{CONTENT_TYPES}}}Default")}
+    overrides = {
+        o.get("PartName").lstrip("/") for o in types.findall(f"{{{CONTENT_TYPES}}}Override")
+    }
+    names = set(package.zip.namelist()) - {"[Content_Types].xml"}
+
+    assert overrides <= names  # нет типов для удалённых частей
+    for name in names:
+        # Расширение — после последней точки (у «_rels/.rels» это «rels»).
+        assert name in overrides or name.rsplit(".", 1)[-1] in defaults, name
+    assert "jpeg" not in defaults
+
+
+def test_template_artifacts_removed() -> None:
+    package = Package(_render())
+    names = package.zip.namelist()
+    relationship_types = {kind for _, kind, _ in _relationships(package)}
+
+    for artifact in ("thumbnail", "docProps/app.xml", "customXml", "stylesWithEffects"):
+        assert not any(artifact in name for name in names), artifact
+    assert not any(
+        kind.endswith(("/thumbnail", "/extended-properties", "/customXml", "/stylesWithEffects"))
+        for kind in relationship_types
+    )
+    settings = package.zip.read("word/settings.xml").decode()
+    assert "w14:docId" not in settings
+    # rsid сознательно оставлены (OD-3); updateFields и прочие настройки — на месте.
+    assert "w:rsidRoot" in settings and 'w:updateFields w:val="true"' in settings
+
+
+# --- Номер страницы до появления титульного листа (Stage 3.3, m8 отложен) -----------------
+
+
+def test_page_number_without_title_page() -> None:
+    """Титульного листа нет: номер на всех страницах, включая первую (оглавление)."""
+    [section] = Package(_render()).xml("word/document.xml").xpath("w:body/w:sectPr", namespaces=NS)
+
+    assert section.find("w:titlePg", NS) is None
+    footers = [ref.get(_w("type")) for ref in section.findall("w:footerReference", NS)]
+    assert footers == ["default"]
+    assert section.findall("w:headerReference", NS) == []

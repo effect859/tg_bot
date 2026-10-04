@@ -130,8 +130,6 @@ def test_input_is_not_mutated() -> None:
             "sections[0].title",
         ),
         (_document(title="Т" * (MAX_TITLE_CHARS + 1)), E.TITLE_TOO_LONG, "title"),
-        (_document(title_page={"student": "Иванов"}), E.TITLE_PAGE_UNSUPPORTED, "title_page"),
-        (_document(references=["Источник"]), E.REFERENCES_UNSUPPORTED, "references"),
     ],
     ids=[
         "no-sections",
@@ -144,14 +142,91 @@ def test_input_is_not_mutated() -> None:
         "depth-3",
         "section-title-too-long",
         "document-title-too-long",
-        "title-page",
-        "references",
     ],
 )
 def test_invalid_structure(content: DocumentContent, code: E, path: str) -> None:
     error = _error(content)
 
     assert (error.code, error.path) == (code, path)
+
+
+# --- Титульный лист и список литературы: данные, а не возможности рендерера ----------
+
+
+def test_non_empty_title_page_and_references_pass_domain() -> None:
+    """Поддерживает ли их рендерер, решает рендерер; домен проверяет только данные."""
+    content = _document(
+        title_page={"student_name": "Иванов Иван", "university": "НИУ ВШЭ"},
+        references=["Источник 1.", "Источник 2."],
+    )
+
+    validate_document_content(content)
+
+
+@pytest.mark.parametrize(
+    ("title_page", "code", "path"),
+    [
+        ({"student_name": "до\x00после"}, E.INVALID_CHARACTER, "title_page['student_name']"),
+        ({"student_name": "до\nпосле"}, E.INVALID_CHARACTER, "title_page['student_name']"),
+        (
+            {"student_name": "до" + chr(0xD800) + "после"},
+            E.SURROGATE_CHARACTER,
+            "title_page['student_name']",
+        ),
+        ({"ключ\x07": "значение"}, E.INVALID_CHARACTER, "title_page.keys[0]"),
+        ({"ок": "т", "ключ" + chr(0xDFFF): "т"}, E.SURROGATE_CHARACTER, "title_page.keys[1]"),
+    ],
+    ids=["value-control", "value-newline", "value-surrogate", "key-control", "key-surrogate"],
+)
+def test_title_page_invalid_characters(title_page: dict[str, str], code: E, path: str) -> None:
+    error = _error(_document(title_page=title_page))
+
+    assert (error.code, error.path) == (code, path)
+
+
+@pytest.mark.parametrize(
+    ("char", "code"),
+    [
+        ("\x00", E.INVALID_CHARACTER),
+        ("\t", E.INVALID_CHARACTER),
+        (chr(0xFFFE), E.INVALID_CHARACTER),
+        (chr(0xD800), E.SURROGATE_CHARACTER),
+    ],
+    ids=["U+0000", "U+0009", "U+FFFE", "U+D800"],
+)
+def test_references_invalid_characters(char: str, code: E) -> None:
+    error = _error(_document(references=["Источник.", f"до{char}после"]))
+
+    assert (error.code, error.path) == (code, "references[1]")
+
+
+def test_title_page_and_references_count_toward_size() -> None:
+    """Общий лимит не обходится через титульный лист и список литературы."""
+    title, section_title, paragraph = "Т", "Р", "т"
+    room = MAX_DOCUMENT_CHARS - len(title) - len(section_title) - len(paragraph)
+    section = Section(title=section_title, paragraphs=[paragraph])
+
+    key = "k"
+    fits = _document(section, title=title, title_page={key: "а" * (room - len(key))})
+    validate_document_content(fits)
+    validate_document_content(_document(section, title=title, references=["б" * room]))
+
+    # На один символ больше: бюджет общий и накопительный, поэтому лимит пересекает
+    # последний учтённый текст — абзац раздела (титульный лист и литература — раньше).
+    by_one = [
+        _document(section, title=title, title_page={key: "а" * (room - len(key) + 1)}),
+        _document(section, title=title, references=["б" * (room + 1)]),
+    ]
+    for content in by_one:
+        error = _error(content)
+        assert (error.code, error.path) == (E.TOO_LARGE, "sections[0].paragraphs[0]")
+
+    # Само поле больше лимита — путь указывает на него.
+    huge = "в" * MAX_DOCUMENT_CHARS
+    error = _error(_document(section, title=title, title_page={key: huge}))
+    assert (error.code, error.path) == (E.TOO_LARGE, "title_page['k']")
+    error = _error(_document(section, title=title, references=[huge]))
+    assert (error.code, error.path) == (E.TOO_LARGE, "references[0]")
 
 
 @pytest.mark.parametrize(

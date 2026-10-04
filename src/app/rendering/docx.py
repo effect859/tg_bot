@@ -15,6 +15,11 @@ Heading 1, Heading 2), а не прямым форматированием аб�
 оглавлении и в любом редакторе. Номера страниц оглавления рендерер не считает:
 поле TOC заполняет Word или LibreOffice при открытии или обновлении полей.
 
+Строки оглавления оформлены явными стилями toc 1 и toc 2. Из пакета убраны
+артефакты шаблона python-docx (миниатюра, свойства приложения, customXml,
+stylesWithEffects, w14:docId). Титульного листа и списка литературы рендерер пока
+не поддерживает: непустые title_page и references отклоняются до создания документа.
+
 Результат детерминирован: одинаковый документ — одинаковые байты (метаданные без
 дат и автора, у записей ZIP фиксированное время).
 """
@@ -26,7 +31,9 @@ from dataclasses import dataclass
 from docx import Document
 from docx.document import Document as DocxDocument
 from docx.enum.section import WD_ORIENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.style import WD_STYLE_TYPE
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT, WD_TAB_LEADER
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.oxml.xmlchemy import BaseOxmlElement
@@ -65,6 +72,13 @@ class Layout:
     toc_title: str
     # Уровни заголовков в оглавлении (ключ \o поля TOC).
     toc_levels: str
+    # Левый отступ строки подраздела в оглавлении (стиль toc 2).
+    toc_level_indent_cm: float
+
+    @property
+    def text_width_mm(self) -> float:
+        """Ширина текста: страница без левого и правого полей."""
+        return self.page_width_mm - self.margin_left_mm - self.margin_right_mm
 
 
 GOST_7_32 = Layout(
@@ -82,6 +96,7 @@ GOST_7_32 = Layout(
     language="ru-RU",
     toc_title="СОДЕРЖАНИЕ",
     toc_levels="1-2",
+    toc_level_indent_cm=1.25,
 )
 
 # Время записей ZIP: самое раннее, допустимое форматом.
@@ -102,15 +117,23 @@ class PracticeReportDocxRenderer:
         """Raises InvalidDocumentError — до создания документа."""
         if content.doc_type is not DocType.PRACTICE_REPORT:
             raise InvalidDocumentError(DocumentErrorCode.UNSUPPORTED_DOC_TYPE, "doc_type")
+        # Возможности этого рендерера: титульного листа и списка литературы пока нет —
+        # непустые не выводятся молча, а отклоняются.
+        if content.title_page:
+            raise InvalidDocumentError(DocumentErrorCode.TITLE_PAGE_UNSUPPORTED, "title_page")
+        if content.references:
+            raise InvalidDocumentError(DocumentErrorCode.REFERENCES_UNSUPPORTED, "references")
         validate_document_content(content)
 
         document = Document()
         self._setup_styles(document)
+        self._add_toc_styles(document)
         self._setup_page(document)
         self._add_table_of_contents(document)
         for number, section in enumerate(content.sections, start=1):
             self._add_section(document, section, str(number), level=1)
         _set_metadata(document, content.title)
+        _strip_template_artifacts(document)
 
         buffer = io.BytesIO()
         document.save(buffer)
@@ -168,6 +191,26 @@ class PracticeReportDocxRenderer:
             fonts.attrib.pop(qn(attribute), None)
         for attribute in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
             fonts.set(qn(attribute), self._layout.font_name)
+
+    def _add_toc_styles(self, document: DocxDocument) -> None:
+        """Встроенные стили строк оглавления toc 1 и toc 2.
+
+        Без них Word берёт латентные стили на основе Normal, и строки оглавления
+        получают абзацный отступ и выравнивание по ширине. Шрифт и интервал
+        наследуются от Normal; номер страницы — у правого края текста, с точками.
+        """
+        layout = self._layout
+        for level, left_indent_cm in ((1, 0.0), (2, layout.toc_level_indent_cm)):
+            style = document.styles.add_style(f"toc {level}", WD_STYLE_TYPE.PARAGRAPH, builtin=True)
+            assert isinstance(style, ParagraphStyle)
+            style.base_style = document.styles["Normal"]
+            paragraph = style.paragraph_format
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            paragraph.first_line_indent = Cm(0)
+            paragraph.left_indent = Cm(left_indent_cm)
+            paragraph.tab_stops.add_tab_stop(
+                Mm(layout.text_width_mm), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS
+            )
 
     def _setup_page(self, document: DocxDocument) -> None:
         layout = self._layout
@@ -295,6 +338,39 @@ def _set_metadata(document: DocxDocument, title: str) -> None:
         found = element.find(qn(name))
         if found is not None:
             element.remove(found)
+
+
+# Части шаблона python-docx, которые не относятся к документу и вводят в заблуждение:
+# миниатюра пустого шаблона, свойства приложения («Microsoft Macintosh Word», 0 слов),
+# хранилище библиографии со статичным GUID, копия стилей для Word 2010.
+_STYLES_WITH_EFFECTS = "http://schemas.microsoft.com/office/2007/relationships/stylesWithEffects"
+_TEMPLATE_ARTIFACT_RELATIONSHIPS = frozenset(
+    {RT.THUMBNAIL, RT.EXTENDED_PROPERTIES, RT.CUSTOM_XML, _STYLES_WITH_EFFECTS}
+)
+# Идентификатор документа шаблона: одинаковый у всех отчётов.
+_TEMPLATE_SETTINGS_IDS = ("w14:docId",)
+
+
+def _strip_template_artifacts(document: DocxDocument) -> None:
+    """Убирает артефакты шаблона, снимая связи на них.
+
+    Части в пакет попадают обходом графа связей, поэтому без связи часть не
+    сохраняется, а [Content_Types].xml и .rels остаются согласованными. Нумерация
+    списков, тема, таблица шрифтов, веб-настройки и rsid остаются: на них ссылаются
+    стили шаблона.
+    """
+    for source in (document.part.package, document.part):
+        artifacts = [
+            r_id
+            for r_id, relationship in source.rels.items()
+            if relationship.reltype in _TEMPLATE_ARTIFACT_RELATIONSHIPS
+        ]
+        for r_id in artifacts:
+            source.rels.pop(r_id)
+    settings = document.settings.element
+    for name in _TEMPLATE_SETTINGS_IDS:
+        for element in settings.findall(qn(name)):
+            settings.remove(element)
 
 
 def _normalize_zip(data: bytes) -> bytes:

@@ -8,8 +8,9 @@
 В каждой строке — только символы, допустимые в XML и в одном абзаце: без
 управляющих (в том числе переводов строк и табуляции) и без суррогатов.
 
-Титульного листа и списка литературы на этом этапе нет: непустые title_page и
-references отклоняются, а не теряются молча.
+Здесь проверяются данные, а не возможности конкретного рендерера: у title_page и
+references — символы и общий размер документа. Поддерживает ли рендерер титульный
+лист и список литературы, решает сам рендерер (сейчас DOCX отклоняет непустые).
 
 Ошибка несёт код и путь до места (``sections[1].subsections[0].paragraphs[2]``), но
 не сам текст: текст отчёта не попадает в логи.
@@ -65,10 +66,6 @@ def validate_document_content(content: DocumentContent) -> None:
 
     Raises InvalidDocumentError.
     """
-    if content.title_page:
-        raise InvalidDocumentError(DocumentErrorCode.TITLE_PAGE_UNSUPPORTED, "title_page")
-    if content.references:
-        raise InvalidDocumentError(DocumentErrorCode.REFERENCES_UNSUPPORTED, "references")
     # Название документа (тема) может быть пустым: на этом этапе оно не выводится в текст.
     _check_text(content.title, "title")
     if len(content.title) > MAX_TITLE_CHARS:
@@ -77,8 +74,24 @@ def validate_document_content(content: DocumentContent) -> None:
         raise InvalidDocumentError(DocumentErrorCode.NO_SECTIONS, "sections")
 
     counter = _Counter(chars=len(content.title))
+    _check_title_page(content.title_page, counter)
+    for index, reference in enumerate(content.references):
+        path = f"references[{index}]"
+        counter.add_chars(len(reference), path)
+        _check_text(reference, path)
     for index, section in enumerate(content.sections):
         _check_section(section, f"sections[{index}]", 1, counter)
+
+
+def _check_title_page(title_page: dict[str, str], counter: "_Counter") -> None:
+    """Ключи и значения титульного листа: символы и общий размер (путь — без значения)."""
+    for index, (key, value) in enumerate(title_page.items()):
+        key_path = f"title_page.keys[{index}]"
+        counter.add_chars(len(key), key_path)
+        _check_text(key, key_path)
+        value_path = f"title_page[{key!r}]"
+        counter.add_chars(len(value), value_path)
+        _check_text(value, value_path)
 
 
 class _Counter:
