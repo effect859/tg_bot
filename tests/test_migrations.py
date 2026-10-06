@@ -383,3 +383,95 @@ def test_report_sections_deleted_with_order(database_url: str) -> None:
         assert asyncio.run(_query(database_url, count, {"order": ids["order"]})) == [(0,)]
     finally:
         asyncio.run(_cleanup(database_url))
+
+
+# --- 0008: готовый файл отчёта ---------------------------------------------------------------
+
+REPORT_FILE_TABLE = "SELECT to_regclass('order_report_files')::text"
+REPORT_FILE_CONSTRAINTS = (
+    "SELECT conname FROM pg_constraint WHERE conrelid = 'order_report_files'::regclass "
+    "AND contype IN ('c', 'u', 'f') ORDER BY conname"
+)
+REPORT_FILE_INDEXES = (
+    "SELECT indexname FROM pg_indexes WHERE tablename = 'order_report_files' ORDER BY indexname"
+)
+SHA256 = "0" * 64
+
+
+def _insert_report_file(
+    url: str, ids: dict[str, int], *, size: int = 1, sha256: str = SHA256
+) -> None:
+    asyncio.run(
+        _query(
+            url,
+            "INSERT INTO order_report_files (order_id, plan_version_id, storage_key, size_bytes, "
+            "sha256) VALUES (:order, :plan, 'orders/1/report/plan-1.docx', :size, :sha256)",
+            {**ids, "size": size, "sha256": sha256},
+        )
+    )
+
+
+def test_report_files_migration_downgrade_and_upgrade(database_url: str) -> None:
+    config = make_alembic_config(database_url)
+    try:
+        ids = asyncio.run(_seed_plan(database_url))
+        assert asyncio.run(_query(database_url, REPORT_FILE_TABLE)) == [("order_report_files",)]
+        assert [row[0] for row in asyncio.run(_query(database_url, REPORT_FILE_CONSTRAINTS))] == [
+            "ck_order_report_files_sha256_hex",
+            "ck_order_report_files_size_positive",
+            "fk_order_report_files_order_id_orders",
+            "fk_order_report_files_plan_version_id_order_plan_versions",
+            "uq_order_report_files_plan_version_id",
+        ]
+        assert [row[0] for row in asyncio.run(_query(database_url, REPORT_FILE_INDEXES))] == [
+            "ix_order_report_files_order_id",
+            "pk_order_report_files",
+            "uq_order_report_files_plan_version_id",
+        ]
+        _insert_report_file(database_url, ids)
+
+        command.downgrade(config, "0007")
+        assert asyncio.run(_query(database_url, REPORT_FILE_TABLE)) == [(None,)]
+
+        command.upgrade(config, "head")
+        # Таблица пуста и рабочая.
+        count = "SELECT count(*) FROM order_report_files WHERE order_id = :order"
+        assert asyncio.run(_query(database_url, count, {"order": ids["order"]})) == [(0,)]
+        _insert_report_file(database_url, ids)
+    finally:
+        command.upgrade(config, "head")
+        asyncio.run(_cleanup(database_url))
+
+
+@pytest.mark.parametrize(
+    ("size", "sha256", "constraint"),
+    [
+        (1, SHA256, "uq_order_report_files_plan_version_id"),
+        (0, "1" * 64, "ck_order_report_files_size_positive"),
+        (1, "A" * 64, "ck_order_report_files_sha256_hex"),
+        (1, "0" * 63, "ck_order_report_files_sha256_hex"),
+    ],
+)
+def test_report_file_constraints(
+    database_url: str, size: int, sha256: str, constraint: str
+) -> None:
+    try:
+        ids = asyncio.run(_seed_plan(database_url))
+        _insert_report_file(database_url, ids)
+        # Второй файл той же версии плана — нарушение UNIQUE; остальные — CHECK
+        # (значения проверяются раньше уникальности).
+        with pytest.raises(Exception, match=constraint):
+            _insert_report_file(database_url, ids, size=size, sha256=sha256)
+    finally:
+        asyncio.run(_cleanup(database_url))
+
+
+def test_report_files_deleted_with_order(database_url: str) -> None:
+    try:
+        ids = asyncio.run(_seed_plan(database_url))
+        _insert_report_file(database_url, ids)
+        asyncio.run(_cleanup(database_url))  # удаляет заказы: файлы — каскадом
+        count = "SELECT count(*) FROM order_report_files WHERE order_id = :order"
+        assert asyncio.run(_query(database_url, count, {"order": ids["order"]})) == [(0,)]
+    finally:
+        asyncio.run(_cleanup(database_url))

@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from pathlib import Path
 
 
@@ -20,9 +21,16 @@ class LocalFileStorage:
         def _write() -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             # Пишем во временный файл и переименовываем: читатель не увидит недописанный файл.
-            tmp = path.with_name(path.name + ".tmp")
-            tmp.write_bytes(data)
-            tmp.replace(path)
+            # Свой временный файл на каждую запись: одновременные save одного ключа не
+            # усекают чужой tmp, и replace всегда ставит полный файл.
+            tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                with tmp.open("xb") as file:
+                    file.write(data)
+                tmp.replace(path)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
 
         await asyncio.to_thread(_write)
 

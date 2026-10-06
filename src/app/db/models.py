@@ -211,6 +211,31 @@ class OrderReportSection(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class OrderReportFile(Base):
+    """Готовый файл отчёта в FileStorage: строка = результат версии плана.
+
+    Строка только вставляется — в той же транзакции, что и переход заказа в
+    COMPLETED. Выходной файл, а не материал: order_files не используется.
+    """
+
+    __tablename__ = "order_report_files"
+    __table_args__ = (
+        # Один результат на версию плана: второй файл того же плана невозможен.
+        UniqueConstraint("plan_version_id"),
+        CheckConstraint("size_bytes > 0", name="size_positive"),
+        CheckConstraint("sha256 ~ '^[0-9a-f]{64}$'", name="sha256_hex"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), index=True)
+    plan_version_id: Mapped[int] = mapped_column(ForeignKey("order_plan_versions.id"))
+    storage_key: Mapped[str] = mapped_column(String(512))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    # SHA-256 байтов файла, 64 шестнадцатеричные цифры в нижнем регистре.
+    sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class OrderMaterial(TimestampMixin, Base):
     """Материал заказа, присланный пользователем (задание, методичка, пример отчёта).
 
