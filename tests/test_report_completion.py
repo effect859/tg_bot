@@ -684,7 +684,7 @@ async def test_completion_recovery_registered_without_llm(
     file_storage = LocalFileStorage(tmp_path)
     dispatcher = create_dispatcher(sessionmaker, MemoryStorage(), file_storage)
 
-    [startup] = dispatcher.startup.handlers
+    startup, _delivery = dispatcher.startup.handlers
     await startup.callback(None)
 
     assert created == [(sessionmaker, file_storage)]

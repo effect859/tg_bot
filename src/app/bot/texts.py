@@ -281,6 +281,13 @@ PLAN_VIEW_LIMITS: tuple[tuple[int, int, int, int, int, int], ...] = (
 
 NO_ORDERS = "У вас пока нет заказов."
 
+BTN_DOWNLOAD_REPORT = "📄 Скачать отчёт"
+# Подпись документа при фоновой доставке: номер заказа — в имени файла.
+REPORT_DELIVERED = f"✅ Ваш отчёт готов. Скачать его снова можно в «{BTN_MY_ORDERS}»."
+REPORT_NOT_READY = "Отчёт по этому заказу ещё не готов."
+REPORT_UNAVAILABLE = "Файл отчёта сейчас недоступен."
+REPORT_DOWNLOAD_FAILED = "Не удалось отправить отчёт из-за технической ошибки. Попробуйте позже."
+
 HELP = (
     "<b>Как это работает</b>\n"
     "1. Вы присылаете задание на практику и отвечаете на пару вопросов.\n"
@@ -317,6 +324,14 @@ def orders_list(orders: list[Order]) -> str:
         status = ORDER_STATUS_LABELS.get(order.status, order.status)
         lines.append(f"#{order.id} · {doc} · {status} · {created}")
     return "\n".join(lines)
+
+
+def download_report_button(order_id: int) -> str:
+    return f"{BTN_DOWNLOAD_REPORT} #{order_id}"
+
+
+def report_ready(order_id: int) -> str:
+    return f"✅ Отчёт по заказу #{order_id}"
 
 
 def status_label(status: OrderStatus) -> str:

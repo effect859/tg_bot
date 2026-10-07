@@ -2,7 +2,15 @@ from collections.abc import Callable
 from functools import partial
 
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramEntityTooLarge,
+    TelegramForbiddenError,
+    TelegramNotFound,
+)
 from aiogram.fsm.storage.base import BaseStorage
+from aiogram.types import BufferedInputFile
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot import texts
@@ -17,6 +25,7 @@ from app.services.material_recovery import MaterialRecovery
 from app.services.periodic import PeriodicPass
 from app.services.plan_generation import PlanRecovery
 from app.services.report_completion import ReportCompletionRecovery
+from app.services.report_delivery import DeliveryError, ReportDeliveryRecovery
 from app.services.report_generation import ReportGenerationRecovery
 from app.services.requirements_analysis import AnalysisOutcome, AnalysisRecovery
 from app.services.storage.base import FileStorage
@@ -71,6 +80,13 @@ def create_dispatcher(
     # Завершение отчёта (DOCX → хранилище → COMPLETED) не вызывает модель: работает
     # и без LLM-клиента.
     _run_while_polling(dispatcher, lambda bot: ReportCompletionRecovery(sessionmaker, file_storage))
+    # Доставка готового DOCX пользователю — тоже без LLM-клиента.
+    _run_while_polling(
+        dispatcher,
+        lambda bot: ReportDeliveryRecovery(
+            sessionmaker, file_storage, partial(send_report_document, bot)
+        ),
+    )
     return dispatcher
 
 
@@ -116,3 +132,36 @@ async def notify_plan_outcome(bot: Bot, chat_id: int, outcome: PlanOutcome) -> N
     if reply is not None:
         text, markup = reply
         await bot.send_message(chat_id, text, reply_markup=markup)
+
+
+TELEGRAM_FORBIDDEN = "forbidden"
+TELEGRAM_BAD_REQUEST = "bad_request"
+TELEGRAM_TOO_LARGE = "too_large"
+TELEGRAM_ERROR = "telegram_error"
+
+
+async def send_report_document(bot: Bot, chat_id: int, data: bytes, filename: str) -> None:
+    """ReportSender для фоновой доставки: документ в чат пользователя.
+
+    Ошибки aiogram переводятся в DeliveryError: только код, без текста исключения
+    (в нём может оказаться описание запроса) и без содержимого отчёта.
+    """
+    document = BufferedInputFile(data, filename=filename)
+    try:
+        await bot.send_document(chat_id, document, caption=texts.REPORT_DELIVERED)
+    except TelegramAPIError as exc:
+        raise _delivery_error(exc) from None
+
+
+def _delivery_error(exc: TelegramAPIError) -> DeliveryError:
+    # TelegramEntityTooLarge — подкласс TelegramNetworkError: проверяется раньше.
+    if isinstance(exc, TelegramEntityTooLarge):
+        return DeliveryError(TELEGRAM_TOO_LARGE, temporary=False)
+    if isinstance(exc, TelegramForbiddenError):
+        # Бот заблокирован пользователем: повтор бесполезен.
+        return DeliveryError(TELEGRAM_FORBIDDEN, temporary=False)
+    if isinstance(exc, TelegramBadRequest | TelegramNotFound):
+        return DeliveryError(TELEGRAM_BAD_REQUEST, temporary=False)
+    # TelegramRetryAfter, TelegramNetworkError, TelegramServerError и прочие —
+    # повтор в следующем проходе (число попыток ограничено).
+    return DeliveryError(TELEGRAM_ERROR, temporary=True)

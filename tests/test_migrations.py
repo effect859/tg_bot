@@ -475,3 +475,148 @@ def test_report_files_deleted_with_order(database_url: str) -> None:
         assert asyncio.run(_query(database_url, count, {"order": ids["order"]})) == [(0,)]
     finally:
         asyncio.run(_cleanup(database_url))
+
+
+# --- 0009: доставка готового отчёта ----------------------------------------------------------
+
+DELIVERY_TABLE = "SELECT to_regclass('order_report_deliveries')::text"
+DELIVERY_CONSTRAINTS = (
+    "SELECT conname FROM pg_constraint WHERE conrelid = 'order_report_deliveries'::regclass "
+    "AND contype IN ('c', 'u', 'f') ORDER BY conname"
+)
+DELIVERY_INDEXES = (
+    "SELECT indexname FROM pg_indexes WHERE tablename = 'order_report_deliveries' "
+    "ORDER BY indexname"
+)
+DELIVERY_CASCADE = (
+    "SELECT confdeltype::text FROM pg_constraint "
+    "WHERE conname = 'fk_order_report_deliveries_report_file_id_order_report_files'"
+)
+DELIVERY_BY_FILE = "SELECT count(*) FROM order_report_deliveries WHERE report_file_id = :file"
+DELIVERY_COUNT = (
+    "SELECT count(*) FROM order_report_deliveries d "
+    "JOIN order_report_files f ON f.id = d.report_file_id WHERE f.order_id = :order"
+)
+
+
+def _seed_report_file(url: str) -> dict[str, int]:
+    """Заказ, план и строка файла (зафиксировано): id заказа, плана и файла."""
+    ids = asyncio.run(_seed_plan(url))
+    _insert_report_file(url, ids)
+    [(file_id,)] = asyncio.run(
+        _query(url, "SELECT id FROM order_report_files WHERE order_id = :order", ids)
+    )
+    return {**ids, "file": file_id}
+
+
+def _insert_delivery(url: str, file_id: int, values: str = "0, NULL, NULL, NULL") -> None:
+    asyncio.run(
+        _query(
+            url,
+            "INSERT INTO order_report_deliveries "
+            f"(report_file_id, attempts, started_at, delivered_at, error) VALUES (:file, {values})",
+            {"file": file_id},
+        )
+    )
+
+
+def test_report_deliveries_migration_downgrade_and_upgrade(database_url: str) -> None:
+    config = make_alembic_config(database_url)
+    try:
+        ids = _seed_report_file(database_url)
+        assert asyncio.run(_query(database_url, DELIVERY_TABLE)) == [("order_report_deliveries",)]
+        assert [row[0] for row in asyncio.run(_query(database_url, DELIVERY_CONSTRAINTS))] == [
+            "ck_order_report_deliveries_attempts_non_negative",
+            "ck_order_report_deliveries_delivered_xor_error",
+            "ck_order_report_deliveries_started_only_while_pending",
+            "fk_order_report_deliveries_report_file_id_order_report_files",
+            "uq_order_report_deliveries_report_file_id",
+        ]
+        # Отдельного индекса нет: поиск по файлу обслуживает UNIQUE.
+        assert [row[0] for row in asyncio.run(_query(database_url, DELIVERY_INDEXES))] == [
+            "pk_order_report_deliveries",
+            "uq_order_report_deliveries_report_file_id",
+        ]
+        assert asyncio.run(_query(database_url, DELIVERY_CASCADE)) == [("c",)]
+        _insert_delivery(database_url, ids["file"])
+
+        command.downgrade(config, "0008")
+        assert asyncio.run(_query(database_url, DELIVERY_TABLE)) == [(None,)]
+        # Файл отчёта (0008) остался.
+        count = "SELECT count(*) FROM order_report_files WHERE order_id = :order"
+        assert asyncio.run(_query(database_url, count, {"order": ids["order"]})) == [(1,)]
+
+        command.upgrade(config, "head")
+        # Таблица пуста и рабочая; attempts по умолчанию — 0.
+        assert asyncio.run(_query(database_url, DELIVERY_COUNT, ids)) == [(0,)]
+        asyncio.run(
+            _query(
+                database_url,
+                "INSERT INTO order_report_deliveries (report_file_id) VALUES (:file)",
+                ids,
+            )
+        )
+        attempts = "SELECT attempts, created_at IS NOT NULL FROM order_report_deliveries"
+        assert [tuple(r) for r in asyncio.run(_query(database_url, attempts))] == [(0, True)]
+    finally:
+        command.upgrade(config, "head")
+        asyncio.run(_cleanup(database_url))
+
+
+@pytest.mark.parametrize(
+    ("values", "constraint"),
+    [
+        ("-1, NULL, NULL, NULL", "ck_order_report_deliveries_attempts_non_negative"),
+        ("1, NULL, now(), 'forbidden'", "ck_order_report_deliveries_delivered_xor_error"),
+        ("1, now(), now(), NULL", "ck_order_report_deliveries_started_only_while_pending"),
+        ("1, now(), NULL, 'forbidden'", "ck_order_report_deliveries_started_only_while_pending"),
+        ("0, NULL, NULL, NULL", "uq_order_report_deliveries_report_file_id"),
+    ],
+)
+def test_report_delivery_constraints(database_url: str, values: str, constraint: str) -> None:
+    try:
+        ids = _seed_report_file(database_url)
+        if constraint.startswith("uq_"):
+            _insert_delivery(database_url, ids["file"])
+        with pytest.raises(Exception, match=constraint):
+            _insert_delivery(database_url, ids["file"], values)
+    finally:
+        asyncio.run(_cleanup(database_url))
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        "0, NULL, NULL, NULL",  # ещё не начата
+        "1, now(), NULL, NULL",  # идёт попытка
+        "1, NULL, now(), NULL",  # доставлено
+        "3, NULL, NULL, 'attempts_exhausted'",  # постоянная ошибка
+    ],
+)
+def test_report_delivery_valid_states(database_url: str, values: str) -> None:
+    try:
+        ids = _seed_report_file(database_url)
+        _insert_delivery(database_url, ids["file"], values)
+        assert asyncio.run(_query(database_url, DELIVERY_COUNT, ids)) == [(1,)]
+    finally:
+        asyncio.run(_cleanup(database_url))
+
+
+def test_report_delivery_deleted_with_file(database_url: str) -> None:
+    try:
+        ids = _seed_report_file(database_url)
+        _insert_delivery(database_url, ids["file"])
+        asyncio.run(_query(database_url, "DELETE FROM order_report_files WHERE id = :file", ids))
+        assert asyncio.run(_query(database_url, DELIVERY_BY_FILE, ids)) == [(0,)]
+    finally:
+        asyncio.run(_cleanup(database_url))
+
+
+def test_report_delivery_deleted_with_order(database_url: str) -> None:
+    try:
+        ids = _seed_report_file(database_url)
+        _insert_delivery(database_url, ids["file"])
+        asyncio.run(_cleanup(database_url))  # удаляет заказы: файлы и доставки — каскадом
+        assert asyncio.run(_query(database_url, DELIVERY_BY_FILE, ids)) == [(0,)]
+    finally:
+        asyncio.run(_cleanup(database_url))

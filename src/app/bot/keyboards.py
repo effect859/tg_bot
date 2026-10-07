@@ -9,6 +9,8 @@ from aiogram.types import (
 )
 
 from app.bot import texts
+from app.db.models import Order
+from app.domain.enums import OrderStatus
 from app.domain.requirements_dialog import EDITABLE_FIELDS
 
 
@@ -64,6 +66,13 @@ class PlanCallback(CallbackData, prefix="plan"):
     digest: str = ""
 
 
+class ReportCallback(CallbackData, prefix="report"):
+    """Кнопка «Скачать отчёт». order_id приходит от клиента: владельца и статус
+    проверяет хендлер."""
+
+    order_id: int
+
+
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -73,6 +82,21 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
     )
+
+
+def orders_keyboard(orders: list[Order]) -> InlineKeyboardMarkup | None:
+    """«Мои заказы»: кнопка скачивания для каждого готового заказа; нет готовых — None."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=texts.download_report_button(order.id),
+                callback_data=ReportCallback(order_id=order.id).pack(),
+            )
+        ]
+        for order in orders
+        if order.status is OrderStatus.COMPLETED
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
 def _order_button(text: str, action: OrderAction, order_id: int) -> InlineKeyboardButton:
