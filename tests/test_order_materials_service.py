@@ -29,6 +29,7 @@ from app.services import order_materials as materials
 from app.services import orders
 from app.services.material_processing import find_recoverable_materials
 from app.services.users import register_or_update_user
+from billing_samples import pay_for_order
 
 S = OrderStatus
 M = MaterialProcessingStatus
@@ -357,8 +358,10 @@ async def test_materials_survive_order_lifecycle(session: AsyncSession) -> None:
         await orders.change_status(session, order.id, status)
     plan = await orders.create_plan_version(session, order.id, PLAN)
     await orders.confirm_plan_version(session, order.id, plan.id)
-    for status in (S.PAYMENT_PENDING, S.PAID, S.GENERATING, S.COMPLETED):
-        await orders.change_status(session, order.id, status)
+    await orders.change_status(session, order.id, S.PAYMENT_PENDING)
+    # PAID — только через списание кредитов (OD-4).
+    await pay_for_order(session, order.id)
+    await orders.change_status(session, order.id, S.COMPLETED)
 
     assert _snapshot(await materials.get_order_materials(session, order.id)) == before
 

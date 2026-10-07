@@ -2,8 +2,9 @@
 
 Составление идёт в том же апдейте (подтверждение ТЗ или «Повторить составление
 плана»), если подключён LLM-клиент; то, что здесь не завершилось, доделывает проход
-восстановления (PlanRecovery). Подтверждённый план переводит заказ в PAYMENT_PENDING;
-оплаты пока нет, заказ можно отменить.
+восстановления (PlanRecovery). Подтверждённый план переводит заказ в PAYMENT_PENDING
+с ценой в кредитах; «Оплатить» списывает кредиты и запускает генерацию
+(services.billing.pay_order).
 
 Ошибки БД логируются только по типу: параметры SQL содержат план и ТЗ. При отказе
 транзакция откатывается до ответа в Telegram.
@@ -21,13 +22,14 @@ from app.bot.handlers.order_intake import _remove_keyboard, _rollback_quietly, _
 from app.bot.keyboards import (
     OrderAction,
     OrderCallback,
+    PayOrderCallback,
     PlanAction,
     PlanCallback,
     cancel_order_keyboard,
     plan_confirmation_keyboard,
     plan_failed_keyboard,
 )
-from app.bot.reminders import active_order_reminder
+from app.bot.reminders import active_order_reminder, payment_reply
 from app.db.models import User
 from app.domain.enums import OrderStatus
 from app.domain.errors import (
@@ -40,6 +42,7 @@ from app.domain.errors import (
 from app.domain.plan import PlanOutcome, PlanOutcomeKind
 from app.domain.requirements_dialog import content_digest
 from app.llm.base import LLMClient
+from app.services.billing import ChargeOutcomeKind, pay_order
 from app.services.orders import get_user_order
 from app.services.plan_confirmation import confirm_plan
 from app.services.plan_generation import generate_plan, restart_plan_generation
@@ -201,9 +204,63 @@ async def confirm_plan_button(
         await _rollback_quietly(session)
         await callback.answer(texts.PLAN_ACTION_FAILED, show_alert=True)
         return
+    price = order.price
     await callback.answer()
     await _remove_keyboard(callback, bot)
-    await _send(callback, bot, texts.plan_confirmed(order_id), cancel_order_keyboard(order_id))
+    text, markup = await payment_reply(session, order_id, user_id, price)
+    await _send(callback, bot, f"{texts.plan_confirmed(order_id)}\n\n{text}", markup)
+
+
+@router.callback_query(PayOrderCallback.filter())
+async def pay_order_button(
+    callback: CallbackQuery,
+    callback_data: PayOrderCallback,
+    session: AsyncSession,
+    user: User,
+    bot: Bot,
+) -> None:
+    """«Оплатить N кредитов»: списание и PAYMENT_PENDING -> PAID -> GENERATING (один commit).
+
+    Владельца, статус, цену и баланс проверяет pay_order под блокировкой заказа и
+    пользователя: повторное или параллельное нажатие не спишет кредиты второй раз.
+    Генерацию запускает проход восстановления (ReportGenerationRecovery).
+    """
+    user_id = user.id
+    order_id = callback_data.order_id
+    try:
+        # Транзакция апдейта: UserMiddleware уже держит строку пользователя, pay_order
+        # блокирует её же, затем заказ — порядок пользователь → заказ, как у всех
+        # хендлеров заказа (отмена, план, ТЗ): взаимной блокировки с ними нет.
+        outcome = await pay_order(session, user_id, order_id)
+    except OrderNotFoundError:
+        await session.rollback()
+        await callback.answer(texts.ORDER_NOT_FOUND, show_alert=True)
+        return
+    except OrderDomainError as exc:
+        # Нарушение целостности (например, нет подтверждённого плана): без списания.
+        logger.error("Order payment refused: order_id=%s error=%s", order_id, type(exc).__name__)
+        await _rollback_quietly(session)
+        await callback.answer(texts.PAYMENT_ACTION_FAILED, show_alert=True)
+        return
+    except SQLAlchemyError as exc:
+        # Без traceback и текста исключения (в нём SQL и параметры).
+        logger.error("Order payment failed: order_id=%s error=%s", order_id, type(exc).__name__)
+        await _rollback_quietly(session)
+        await callback.answer(texts.PAYMENT_ACTION_FAILED, show_alert=True)
+        return
+    match outcome.kind:
+        case ChargeOutcomeKind.PAID:
+            await callback.answer()
+            await _remove_keyboard(callback, bot)
+            await _send(callback, bot, texts.order_paid(order_id, outcome.price, outcome.balance))
+        case ChargeOutcomeKind.INSUFFICIENT:
+            await callback.answer(
+                texts.insufficient_credits(outcome.price, outcome.balance), show_alert=True
+            )
+        case ChargeOutcomeKind.ALREADY_PAID:
+            await callback.answer(texts.ORDER_ALREADY_PAID, show_alert=True)
+        case ChargeOutcomeKind.NOT_PAYABLE:
+            await callback.answer(texts.ORDER_NOT_PAYABLE, show_alert=True)
 
 
 async def _send_current_plan(

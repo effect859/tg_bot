@@ -91,6 +91,12 @@ async def committed_sessionmaker(
     yield async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as connection:
         users = "SELECT id FROM users WHERE tg_id >= :base"
+        # Финансовые записи не удаляются каскадом (FK без ON DELETE): раньше заказов.
+        for table in ("balance_transactions", "payments"):
+            await connection.execute(
+                text(f"DELETE FROM {table} WHERE user_id IN ({users})"),
+                {"base": COMMITTED_TG_ID_BASE},
+            )
         await connection.execute(
             text(f"DELETE FROM orders WHERE user_id IN ({users})"),
             {"base": COMMITTED_TG_ID_BASE},

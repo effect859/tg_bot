@@ -1,8 +1,12 @@
-"""Интерфейс платёжного шлюза. Реализации (Telegram Stars, ЮKassa) — на этапе оплаты.
+"""Интерфейс платёжного шлюза: покупка кредитов за реальные деньги.
 
-Шлюз только общается с провайдером. Запись в payments, начисление в
-balance_transactions и обновление кэша users.balance делает сервис биллинга
-в одной транзакции БД.
+Шлюз только общается с провайдером и приводит его подтверждения к общему виду
+(PaymentNotification). Запись в payments, зачисление в balance_transactions и
+обновление кэша users.balance делает services.billing в одной транзакции БД —
+одинаково для любого провайдера.
+
+Счёт связан с нашей строкой payments через payload (services.billing.topup_payload):
+идентификатор провайдера появляется только после оплаты, искать по нему счёт нельзя.
 """
 
 from dataclasses import dataclass, field
@@ -20,18 +24,26 @@ class Invoice:
 
 @dataclass(frozen=True, slots=True)
 class PaymentNotification:
+    """Подтверждение провайдера в общем виде."""
+
     provider_payment_id: str
     status: PaymentStatus
     amount: int
     currency: str
+    # Payload счёта: ссылка на нашу строку payments.
+    invoice_payload: str
+    # Telegram id плательщика: зачисление — только владельцу счёта.
+    payer_tg_id: int
+    # Без персональных данных: только идентификаторы и суммы.
     raw: dict[str, Any] = field(default_factory=dict)
 
 
 class PaymentGateway(Protocol):
     provider: PaymentProvider
+    currency: str
 
     async def create_invoice(
-        self, *, user_id: int, amount: int, currency: str, description: str
+        self, *, chat_id: int, payload: str, amount: int, title: str, description: str
     ) -> Invoice: ...
 
     async def parse_notification(self, raw: dict[str, Any]) -> PaymentNotification:

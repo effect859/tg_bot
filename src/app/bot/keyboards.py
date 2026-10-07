@@ -10,6 +10,7 @@ from aiogram.types import (
 
 from app.bot import texts
 from app.db.models import Order
+from app.domain.billing import CREDIT_PACKAGES
 from app.domain.enums import OrderStatus
 from app.domain.requirements_dialog import EDITABLE_FIELDS
 
@@ -66,6 +67,25 @@ class PlanCallback(CallbackData, prefix="plan"):
     digest: str = ""
 
 
+class BillingAction(StrEnum):
+    TOPUP_MENU = "menu"
+    BUY = "buy"
+
+
+class BillingCallback(CallbackData, prefix="bill"):
+    """Пополнение баланса: меню пакетов или покупка пакета ``package``."""
+
+    action: BillingAction
+    package: str = ""
+
+
+class PayOrderCallback(CallbackData, prefix="pay"):
+    """«Оплатить N кредитов». order_id приходит от клиента: владельца, статус и цену
+    проверяет services.billing.pay_order под блокировкой заказа."""
+
+    order_id: int
+
+
 class ReportCallback(CallbackData, prefix="report"):
     """Кнопка «Скачать отчёт». order_id приходит от клиента: владельца и статус
     проверяет хендлер."""
@@ -81,6 +101,43 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=texts.BTN_HELP)],
         ],
         resize_keyboard=True,
+    )
+
+
+def topup_keyboard() -> InlineKeyboardMarkup:
+    """Пакеты кредитов: по кнопке на пакет."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=texts.package_button(package),
+                    callback_data=BillingCallback(
+                        action=BillingAction.BUY, package=package.id
+                    ).pack(),
+                )
+            ]
+            for package in CREDIT_PACKAGES
+        ]
+    )
+
+
+def payment_keyboard(order_id: int, price: int, *, can_pay: bool) -> InlineKeyboardMarkup:
+    """Заказ ждёт оплаты: «Оплатить» (кредитов хватает) или «Пополнить», и отмена."""
+    if can_pay:
+        first = InlineKeyboardButton(
+            text=texts.pay_button(price),
+            callback_data=PayOrderCallback(order_id=order_id).pack(),
+        )
+    else:
+        first = InlineKeyboardButton(
+            text=texts.BTN_TOPUP,
+            callback_data=BillingCallback(action=BillingAction.TOPUP_MENU).pack(),
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [first],
+            [_order_button(texts.BTN_CANCEL_ORDER, OrderAction.CANCEL, order_id)],
+        ]
     )
 
 

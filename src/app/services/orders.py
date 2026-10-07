@@ -14,13 +14,15 @@ from sqlalchemy import exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Order, OrderPlanVersion, OrderRequirementsVersion
-from app.domain.enums import DocType, OrderStatus, VersionStatus
+from app.db.models import BalanceTransaction, Order, OrderPlanVersion, OrderRequirementsVersion
+from app.domain.billing import order_price
+from app.domain.enums import DocType, OrderStatus, TransactionReason, VersionStatus
 from app.domain.errors import (
     ActiveOrderExistsError,
     DraftVersionExistsError,
     OrderNotEditableError,
     OrderNotFoundError,
+    OrderNotPaidError,
     OutdatedVersionError,
     PlanNotConfirmedError,
     RequirementsNotConfirmedError,
@@ -100,6 +102,9 @@ async def change_status(
         await _require_confirmed_requirements(session, order_id)
     elif target in (OrderStatus.PAYMENT_PENDING, OrderStatus.PAID):
         await _require_confirmed_plan(session, order_id)
+    if target is OrderStatus.PAID:
+        # Оплата — только списанием кредитов (services.billing.pay_order).
+        await _require_order_charge(session, order_id)
 
     async with _guard_active_order(order.user_id), session.begin_nested():
         if target is OrderStatus.FAILED:
@@ -115,6 +120,10 @@ async def change_status(
             and target is OrderStatus.WAITING_FOR_FILES
         ):
             order.consent_given_at = func.now()
+        # Цена в кредитах фиксируется при первом входе в оплату и больше не
+        # пересчитывается: изменение прайса не меняет оформленный заказ.
+        if target is OrderStatus.PAYMENT_PENDING and order.price is None:
+            order.price = order_price(order.doc_type)
         if target is OrderStatus.COMPLETED:
             order.completed_at = func.now()
         elif target is OrderStatus.CANCELLED:
@@ -319,6 +328,17 @@ async def _require_confirmed_requirements(
     if latest is None or latest.status is not VersionStatus.CONFIRMED:
         raise RequirementsNotConfirmedError(f"Order {order_id} has no confirmed requirements")
     return latest
+
+
+async def _require_order_charge(session: AsyncSession, order_id: int) -> None:
+    stmt = select(
+        exists().where(
+            BalanceTransaction.order_id == order_id,
+            BalanceTransaction.reason == TransactionReason.ORDER_CHARGE,
+        )
+    )
+    if not await session.scalar(stmt):
+        raise OrderNotPaidError(order_id)
 
 
 async def _require_confirmed_plan(session: AsyncSession, order_id: int) -> OrderPlanVersion:

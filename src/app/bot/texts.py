@@ -5,6 +5,7 @@ from datetime import date
 from html import escape
 
 from app.db.models import Order
+from app.domain.billing import CreditPackage
 from app.domain.enums import DocType, MaterialFailureReason, OrderStatus, TextTruncationReason
 from app.domain.errors import (
     ConsentNotGivenError,
@@ -288,6 +289,28 @@ REPORT_NOT_READY = "Отчёт по этому заказу ещё не гото
 REPORT_UNAVAILABLE = "Файл отчёта сейчас недоступен."
 REPORT_DOWNLOAD_FAILED = "Не удалось отправить отчёт из-за технической ошибки. Попробуйте позже."
 
+BTN_TOPUP = "💰 Пополнить баланс"
+TOPUP_CHOOSE = "Выберите пакет кредитов:"
+TOPUP_FAILED = "Не удалось выставить счёт. Попробуйте позже."
+PACKAGE_UNKNOWN = "Этот пакет больше недоступен. Откройте «Баланс» ещё раз."
+PAYMENT_TEMPORARILY_UNAVAILABLE = "Оплата временно недоступна. Попробуйте позже."
+PRE_CHECKOUT_REFUSALS: dict[str, str] = {
+    "unknown_invoice": "Счёт не найден. Выставьте новый в разделе «Баланс».",
+    "foreign_invoice": "Этот счёт выставлен другому пользователю.",
+    "already_paid": "Этот счёт уже оплачен.",
+    "expired": "Счёт устарел. Выставьте новый в разделе «Баланс».",
+    "amount_mismatch": "Сумма счёта не совпадает. Выставьте новый в разделе «Баланс».",
+}
+PAYMENT_PROCESSING_DELAYED = (
+    "Платёж получен. Кредиты будут зачислены автоматически в течение нескольких минут."
+)
+ORDER_ALREADY_PAID = "Этот заказ уже оплачен."
+ORDER_NOT_PAYABLE = "Этот заказ сейчас нельзя оплатить."
+PAYMENT_UNAVAILABLE = "Оплата этого заказа недоступна. Заказ можно отменить, чтобы оформить новый."
+PAYMENT_ACTION_FAILED = (
+    "Не удалось оплатить заказ из-за технической ошибки. Кредиты не списаны. Попробуйте позже."
+)
+
 HELP = (
     "<b>Как это работает</b>\n"
     "1. Вы присылаете задание на практику и отвечаете на пару вопросов.\n"
@@ -312,8 +335,82 @@ def format_money(kopecks: int) -> str:
     return f"{rubles} ₽" if kop == 0 else f"{rubles},{kop:02d} ₽"
 
 
-def balance(kopecks: int) -> str:
-    return f"Ваш баланс: <b>{format_money(kopecks)}</b>"
+def credits(amount: int) -> str:
+    """«1 кредит», «2 кредита», «5 кредитов»."""
+    tail = abs(amount) % 100
+    if 11 <= tail <= 14:
+        word = "кредитов"
+    elif tail % 10 == 1:
+        word = "кредит"
+    elif 2 <= tail % 10 <= 4:
+        word = "кредита"
+    else:
+        word = "кредитов"
+    return f"{amount} {word}"
+
+
+def balance(amount: int) -> str:
+    return f"Ваш баланс: <b>{credits(amount)}</b>"
+
+
+def balance_with_packages(amount: int) -> str:
+    return f"{balance(amount)}\n\n{TOPUP_CHOOSE}"
+
+
+def package_button(package: CreditPackage) -> str:
+    return f"{credits(package.credits)} — {package.stars} ⭐"
+
+
+def invoice_title(package: CreditPackage) -> str:
+    return f"{credits(package.credits)}"
+
+
+def invoice_description(package: CreditPackage) -> str:
+    return (
+        f"Пополнение баланса бота на {credits(package.credits)}. "
+        "Кредиты расходуются на оплату документов."
+    )
+
+
+def pre_checkout_refusal(code: str) -> str:
+    return PRE_CHECKOUT_REFUSALS.get(code, PAYMENT_TEMPORARILY_UNAVAILABLE)
+
+
+def topup_credited(amount: int, balance_after: int) -> str:
+    return f"✅ Зачислено {credits(amount)}. {balance(balance_after)}"
+
+
+def payment_rejected(charge_id: str) -> str:
+    return (
+        "Платёж получен, но кредиты не зачислены автоматически. "
+        f"Сохраните номер платежа: <code>{escape(charge_id)}</code>"
+    )
+
+
+def pay_button(price: int) -> str:
+    return f"✅ Оплатить {credits(price)}"
+
+
+def payment_pending(order_id: int, price: int, balance_now: int) -> str:
+    text = (
+        f"Заказ #{order_id}: стоимость — <b>{credits(price)}</b>, "
+        f"на балансе — {credits(balance_now)}."
+    )
+    if balance_now >= price:
+        return f"{text} Нажмите «Оплатить», чтобы начать генерацию отчёта."
+    return f"{text} Не хватает {credits(price - balance_now)}: пополните баланс."
+
+
+def insufficient_credits(price: int, balance_now: int) -> str:
+    return f"Недостаточно кредитов: нужно {credits(price)}, на балансе {credits(balance_now)}."
+
+
+def order_paid(order_id: int, price: int, balance_after: int) -> str:
+    return (
+        f"✅ Заказ #{order_id} оплачен: списано {credits(price)}, "
+        f"на балансе {credits(balance_after)}.\n\n"
+        "Отчёт генерируется — пришлём файл, когда он будет готов."
+    )
 
 
 def orders_list(orders: list[Order]) -> str:
@@ -456,14 +553,7 @@ def plan_already_restarted(order: Order) -> str:
 
 
 def plan_confirmed(order_id: int) -> str:
-    return f"✅ План отчёта по заказу #{order_id} подтверждён. Оплата пока недоступна."
-
-
-def payment_pending(order_id: int) -> str:
-    return (
-        f"Заказ #{order_id}: план подтверждён. Оплата пока недоступна. "
-        "Заказ можно отменить, чтобы оформить новый."
-    )
+    return f"✅ План отчёта по заказу #{order_id} подтверждён."
 
 
 def plan_view(order_id: int, plan: dict[str, object]) -> str:

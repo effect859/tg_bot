@@ -17,6 +17,7 @@ from app.bot.keyboards import (
     confirmation_keyboard,
     consent_keyboard,
     materials_keyboard,
+    payment_keyboard,
     plan_confirmation_keyboard,
     plan_failed_keyboard,
 )
@@ -26,6 +27,7 @@ from app.domain.errors import VersionNotFoundError
 from app.domain.plan import MAX_PLAN_LLM_CALLS
 from app.domain.requirements import MAX_ANALYSIS_LLM_CALLS
 from app.domain.requirements_dialog import content_digest
+from app.services.billing import get_balance
 from app.services.plan_generation import count_plan_calls, get_plan_draft
 from app.services.requirements_analysis import count_analysis_calls
 from app.services.requirements_dialog import RequirementsDialog, get_dialog
@@ -88,10 +90,24 @@ async def active_order_reminder(session: AsyncSession, order: Order) -> Reply:
             markup = plan_confirmation_keyboard(order_id, content_digest(plan))
             return texts.plan_view(order_id, plan), markup
         case S.PAYMENT_PENDING:
-            # Оплаты пока нет: заказ можно только отменить.
-            return texts.payment_pending(order.id), cancel_order_keyboard(order.id)
+            return await payment_reply(session, order.id, order.user_id, order.price)
         case _:
             return texts.active_order_exists(order), None
+
+
+async def payment_reply(
+    session: AsyncSession, order_id: int, user_id: int, price: int | None
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Заказ ждёт оплаты: цена, баланс и «Оплатить» или «Пополнить»."""
+    if price is None:
+        # Цена фиксируется при входе в PAYMENT_PENDING: нарушение целостности.
+        logger.error("Payment pending order has no price: order_id=%s", order_id)
+        return texts.PAYMENT_UNAVAILABLE, cancel_order_keyboard(order_id)
+    balance = await get_balance(session, user_id)
+    return (
+        texts.payment_pending(order_id, price, balance),
+        payment_keyboard(order_id, price, can_pay=balance >= price),
+    )
 
 
 def dialog_message(dialog: RequirementsDialog) -> tuple[str, InlineKeyboardMarkup]:

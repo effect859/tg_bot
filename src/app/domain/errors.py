@@ -44,6 +44,14 @@ class PlanNotConfirmedError(OrderDomainError):
     """Нет подтверждённой актуальной версии плана."""
 
 
+class OrderNotPaidError(OrderDomainError):
+    """PAID без списания кредитов за заказ (строки ORDER_CHARGE) недопустим."""
+
+    def __init__(self, order_id: int) -> None:
+        super().__init__(f"Order {order_id} has no credit charge")
+        self.order_id = order_id
+
+
 class DraftVersionExistsError(OrderDomainError):
     """У заказа уже есть черновик версии: его нужно подтвердить или отредактировать."""
 

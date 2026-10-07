@@ -90,6 +90,11 @@ async def _seed_failed_materials(url: str) -> None:
 
 async def _cleanup(url: str) -> None:
     users = "SELECT id FROM users WHERE tg_id >= :base"
+    # Финансовые записи не удаляются каскадом (FK без ON DELETE): раньше заказов.
+    for table in ("balance_transactions", "payments"):
+        await _query(
+            url, f"DELETE FROM {table} WHERE user_id IN ({users})", {"base": COMMITTED_TG_ID_BASE}
+        )
     await _query(
         url, f"DELETE FROM orders WHERE user_id IN ({users})", {"base": COMMITTED_TG_ID_BASE}
     )
@@ -618,5 +623,186 @@ def test_report_delivery_deleted_with_order(database_url: str) -> None:
         _insert_delivery(database_url, ids["file"])
         asyncio.run(_cleanup(database_url))  # удаляет заказы: файлы и доставки — каскадом
         assert asyncio.run(_query(database_url, DELIVERY_BY_FILE, ids)) == [(0,)]
+    finally:
+        asyncio.run(_cleanup(database_url))
+
+
+# --- 0010: кредиты и биллинг -----------------------------------------------------------------
+
+BILLING_CONSTRAINTS = (
+    "SELECT conname FROM pg_constraint WHERE conname IN ("
+    "'ck_payments_credits_positive', 'ck_payments_succeeded_has_provider_id', "
+    "'ck_balance_transactions_reason_consistent', 'ck_orders_price_positive') ORDER BY conname"
+)
+BILLING_INDEX = (
+    "SELECT indexdef FROM pg_indexes WHERE indexname = 'uq_balance_transactions_payment_id'"
+)
+CREDITS_COLUMN = (
+    "SELECT data_type, is_nullable FROM information_schema.columns "
+    "WHERE table_name = 'payments' AND column_name = 'credits'"
+)
+
+
+def _seed_billing(url: str) -> dict[str, int]:
+    """Заказ (как _seed_plan), его пользователь и PENDING-платёж на 100 кредитов."""
+    ids = asyncio.run(_seed_plan(url))
+    [(user_id,)] = asyncio.run(_query(url, "SELECT user_id FROM orders WHERE id = :order", ids))
+    [(payment_id,)] = asyncio.run(
+        _query(
+            url,
+            "INSERT INTO payments (user_id, provider, amount, currency, credits, status) "
+            "VALUES (:user, 'telegram_stars', 100, 'XTR', 100, 'pending') RETURNING id",
+            {"user": user_id},
+        )
+    )
+    return {**ids, "user": user_id, "payment": payment_id}
+
+
+def _insert_transaction(url: str, ids: dict[str, int], values: str) -> None:
+    """values — (amount, reason, order_id, payment_id) с параметрами :order и :payment."""
+    asyncio.run(
+        _query(
+            url,
+            "INSERT INTO balance_transactions (user_id, amount, reason, order_id, payment_id) "
+            f"VALUES (:user, {values})",
+            ids,
+        )
+    )
+
+
+def test_billing_migration_downgrade_and_upgrade(database_url: str) -> None:
+    config = make_alembic_config(database_url)
+    try:
+        assert [row[0] for row in asyncio.run(_query(database_url, BILLING_CONSTRAINTS))] == [
+            "ck_balance_transactions_reason_consistent",
+            "ck_orders_price_positive",
+            "ck_payments_credits_positive",
+            "ck_payments_succeeded_has_provider_id",
+        ]
+        [(indexdef,)] = asyncio.run(_query(database_url, BILLING_INDEX))
+        assert "UNIQUE" in indexdef and "WHERE (payment_id IS NOT NULL)" in indexdef
+        assert [tuple(r) for r in asyncio.run(_query(database_url, CREDITS_COLUMN))] == [
+            ("integer", "NO")
+        ]
+
+        command.downgrade(config, "0009")
+        assert asyncio.run(_query(database_url, BILLING_CONSTRAINTS)) == []
+        assert asyncio.run(_query(database_url, BILLING_INDEX)) == []
+        assert asyncio.run(_query(database_url, CREDITS_COLUMN)) == []
+
+        command.upgrade(config, "head")
+        assert len(asyncio.run(_query(database_url, BILLING_CONSTRAINTS))) == 4
+        # Схема рабочая: счёт, зачисление и списание проходят.
+        ids = _seed_billing(database_url)
+        _insert_transaction(database_url, ids, "100, 'topup', NULL, :payment")
+        _insert_transaction(database_url, ids, "-50, 'order_charge', :order, NULL")
+    finally:
+        command.upgrade(config, "head")
+        asyncio.run(_cleanup(database_url))
+
+
+@pytest.mark.parametrize(
+    ("values", "constraint"),
+    [
+        # Пополнение: только плюс, только по платежу, без заказа.
+        ("-100, 'topup', NULL, :payment", "ck_balance_transactions_reason_consistent"),
+        ("100, 'topup', NULL, NULL", "ck_balance_transactions_reason_consistent"),
+        ("100, 'topup', :order, :payment", "ck_balance_transactions_reason_consistent"),
+        # Списание: только минус, только по заказу, без платежа.
+        ("50, 'order_charge', :order, NULL", "ck_balance_transactions_reason_consistent"),
+        ("-50, 'order_charge', NULL, NULL", "ck_balance_transactions_reason_consistent"),
+        ("-50, 'order_charge', :order, :payment", "ck_balance_transactions_reason_consistent"),
+        # Возврат: только плюс и только по заказу.
+        ("-50, 'order_refund', :order, NULL", "ck_balance_transactions_reason_consistent"),
+        ("50, 'order_refund', NULL, NULL", "ck_balance_transactions_reason_consistent"),
+        ("0, 'bonus', NULL, NULL", "ck_balance_transactions_amount_non_zero"),
+    ],
+)
+def test_balance_transaction_constraints(database_url: str, values: str, constraint: str) -> None:
+    try:
+        ids = _seed_billing(database_url)
+        with pytest.raises(Exception, match=constraint):
+            _insert_transaction(database_url, ids, values)
+    finally:
+        asyncio.run(_cleanup(database_url))
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        "100, 'topup', NULL, :payment",
+        "-50, 'order_charge', :order, NULL",
+        "50, 'order_refund', :order, NULL",
+        "10, 'bonus', NULL, NULL",
+        "-10, 'admin_adjust', NULL, NULL",
+    ],
+)
+def test_balance_transaction_valid_rows(database_url: str, values: str) -> None:
+    try:
+        ids = _seed_billing(database_url)
+        _insert_transaction(database_url, ids, values)
+    finally:
+        asyncio.run(_cleanup(database_url))
+
+
+def test_one_topup_per_payment(database_url: str) -> None:
+    try:
+        ids = _seed_billing(database_url)
+        _insert_transaction(database_url, ids, "100, 'topup', NULL, :payment")
+        with pytest.raises(Exception, match="uq_balance_transactions_payment_id"):
+            _insert_transaction(database_url, ids, "100, 'topup', NULL, :payment")
+    finally:
+        asyncio.run(_cleanup(database_url))
+
+
+def test_one_charge_per_order(database_url: str) -> None:
+    try:
+        ids = _seed_billing(database_url)
+        _insert_transaction(database_url, ids, "-50, 'order_charge', :order, NULL")
+        with pytest.raises(Exception, match="uq_balance_transactions_order_id_reason"):
+            _insert_transaction(database_url, ids, "-50, 'order_charge', :order, NULL")
+    finally:
+        asyncio.run(_cleanup(database_url))
+
+
+@pytest.mark.parametrize(
+    ("sql", "constraint"),
+    [
+        ("UPDATE payments SET credits = 0 WHERE id = :payment", "ck_payments_credits_positive"),
+        (
+            "UPDATE payments SET status = 'succeeded' WHERE id = :payment",
+            "ck_payments_succeeded_has_provider_id",
+        ),
+        ("UPDATE orders SET price = 0 WHERE id = :order", "ck_orders_price_positive"),
+        ("UPDATE users SET balance = -1 WHERE id = :user", "ck_users_balance_non_negative"),
+        (
+            "INSERT INTO payments (user_id, provider, provider_payment_id, amount, currency, "
+            "credits, status) VALUES (:user, 'telegram_stars', 'charge-1', 100, 'XTR', 100, "
+            "'succeeded'), (:user, 'telegram_stars', 'charge-1', 100, 'XTR', 100, 'succeeded')",
+            "uq_payments_provider_provider_payment_id",
+        ),
+    ],
+)
+def test_billing_row_constraints(database_url: str, sql: str, constraint: str) -> None:
+    try:
+        ids = _seed_billing(database_url)
+        with pytest.raises(Exception, match=constraint):
+            asyncio.run(_query(database_url, sql, ids))
+    finally:
+        asyncio.run(_cleanup(database_url))
+
+
+def test_succeeded_payment_with_provider_id_is_valid(database_url: str) -> None:
+    try:
+        ids = _seed_billing(database_url)
+        asyncio.run(
+            _query(
+                database_url,
+                "UPDATE payments SET status = 'succeeded', provider_payment_id = 'charge-1', "
+                "credits = 1 WHERE id = :payment",
+                ids,
+            )
+        )
+        asyncio.run(_query(database_url, "UPDATE orders SET price = 1 WHERE id = :order", ids))
     finally:
         asyncio.run(_cleanup(database_url))

@@ -17,11 +17,13 @@ from app.bot import texts
 from app.bot.handlers import menu, order_intake, plan, requirements_dialog, start
 from app.bot.middlewares.db import DbSessionMiddleware
 from app.bot.middlewares.user import UserMiddleware
+from app.bot.stars import fetch_star_transactions
 from app.domain.plan import PlanOutcome
 from app.extraction.base import TextExtractor
 from app.llm.base import LLMClient
 from app.services.material_processing import ProcessingOutcome
 from app.services.material_recovery import MaterialRecovery
+from app.services.payment_reconciliation import PaymentReconciliation
 from app.services.periodic import PeriodicPass
 from app.services.plan_generation import PlanRecovery
 from app.services.report_completion import ReportCompletionRecovery
@@ -86,6 +88,11 @@ def create_dispatcher(
         lambda bot: ReportDeliveryRecovery(
             sessionmaker, file_storage, partial(send_report_document, bot)
         ),
+    )
+    # Сверка платежей Stars: зачисляет кредиты, если successful_payment не обработан.
+    _run_while_polling(
+        dispatcher,
+        lambda bot: PaymentReconciliation(sessionmaker, partial(fetch_star_transactions, bot)),
     )
     return dispatcher
 

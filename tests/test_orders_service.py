@@ -10,6 +10,7 @@ from app.domain.errors import (
     DraftVersionExistsError,
     InvalidStatusTransitionError,
     OrderNotEditableError,
+    OrderNotPaidError,
     OutdatedVersionError,
     PlanNotConfirmedError,
     RequirementsNotConfirmedError,
@@ -19,6 +20,7 @@ from app.domain.order_flow import is_active
 from app.domain.schemas import PlanContent, PlanSection
 from app.services import orders as svc
 from app.services.users import register_or_update_user
+from billing_samples import pay_for_order
 
 S = OrderStatus
 
@@ -101,7 +103,9 @@ async def _to_payment_pending(session: AsyncSession, order: Order) -> Order:
 
 async def _to_completed(session: AsyncSession, order: Order) -> Order:
     order = await _to_payment_pending(session, order)
-    return await _advance(session, order, S.PAID, S.GENERATING, S.COMPLETED)
+    # PAID — только через списание кредитов (OD-4).
+    await pay_for_order(session, order.id)
+    return await _advance(session, order, S.COMPLETED)
 
 
 async def _insert_order(session: AsyncSession, user_id: int, status: S) -> None:
@@ -218,7 +222,9 @@ async def test_full_flow_with_revision(session: AsyncSession) -> None:
     await _confirm_requirements(session, order)
     order = await _advance(session, order, S.PREPARING_PLAN, S.WAITING_FOR_PLAN_CONFIRMATION)
     await _confirm_plan(session, order)
-    order = await _advance(session, order, S.PAYMENT_PENDING, S.PAID, S.GENERATING, S.COMPLETED)
+    order = await _advance(session, order, S.PAYMENT_PENDING)
+    await pay_for_order(session, order.id)
+    order = await _advance(session, order, S.COMPLETED)
     assert order.completed_at is not None
     assert await svc.can_create_order(session, order.user_id)
 
@@ -377,7 +383,7 @@ async def test_new_plan_version_keeps_old_one(session: AsyncSession) -> None:
 
 async def test_versions_are_frozen_after_payment(session: AsyncSession) -> None:
     order = await _to_payment_pending(session, await _order(session))
-    order = await _advance(session, order, S.PAID)
+    await pay_for_order(session, order.id)
 
     with pytest.raises(OrderNotEditableError):
         await svc.create_requirements_version(session, order.id, REQUIREMENTS)
@@ -421,11 +427,17 @@ async def test_paid_guard_does_not_depend_on_path(session: AsyncSession) -> None
 
 
 async def test_paid_with_confirmed_plan(session: AsyncSession) -> None:
+    """OD-4: подтверждённого плана мало — PAID только после списания кредитов."""
     order = await _to_payment_pending(session, await _order(session))
 
-    order = await svc.change_status(session, order.id, S.PAID)
+    with pytest.raises(OrderNotPaidError):
+        await svc.change_status(session, order.id, S.PAID)
+    await session.refresh(order)
+    assert order.status is S.PAYMENT_PENDING
 
-    assert order.status is S.PAID
+    await pay_for_order(session, order.id)
+    await session.refresh(order)
+    assert order.status is S.GENERATING
 
 
 # --- L: FAILED -----------------------------------------------------------------------
@@ -465,7 +477,8 @@ async def test_failed_before_payment_can_be_cancelled(session: AsyncSession) -> 
 
 async def test_failed_generation_retries_but_cannot_cancel(session: AsyncSession) -> None:
     order = await _to_payment_pending(session, await _order(session))
-    order = await _advance(session, order, S.PAID, S.GENERATING, S.FAILED)
+    await pay_for_order(session, order.id)
+    order = await _advance(session, order, S.FAILED)
     assert order.failed_from_status is S.GENERATING
 
     with pytest.raises(InvalidStatusTransitionError):

@@ -27,11 +27,18 @@ from app.bot.handlers.order_intake import cancel_order, new_report
 from app.bot.handlers.plan import confirm_plan_button
 from app.bot.handlers.requirements_dialog import answer_requirement
 from app.bot.handlers.start import cmd_start
-from app.bot.keyboards import OrderAction, OrderCallback, PlanAction, PlanCallback
+from app.bot.keyboards import (
+    BillingCallback,
+    OrderAction,
+    OrderCallback,
+    PlanAction,
+    PlanCallback,
+)
 from app.bot.reminders import active_order_reminder
 from app.bot.setup import create_dispatcher
 from app.db.models import Order, OrderPlanVersion, User
-from app.domain.enums import OrderStatus, VersionStatus
+from app.domain.billing import order_price
+from app.domain.enums import DocType, OrderStatus, VersionStatus
 from app.domain.requirements_dialog import content_digest
 from app.services import orders
 from app.services.plan_generation import generate_plan
@@ -80,9 +87,28 @@ def _buttons(markup: Any) -> list[str]:
 def _actions(markup: Any) -> list[str]:
     actions = []
     for data in _buttons(markup):
-        callback_type = PlanCallback if data.startswith("plan:") else OrderCallback
+        if data.startswith("pay:"):
+            actions.append("pay")
+            continue
+        callback_type: Any = OrderCallback
+        if data.startswith("plan:"):
+            callback_type = PlanCallback
+        elif data.startswith("bill:"):
+            callback_type = BillingCallback
         actions.append(callback_type.unpack(data).action.value)
     return actions
+
+
+# Цена фиксируется при подтверждении плана; баланс в этих тестах — 0.
+PRICE = order_price(DocType.PRACTICE_REPORT)
+
+
+def _pending_text(order_id: int) -> str:
+    return texts.payment_pending(order_id, PRICE, 0)
+
+
+def _confirmed_text(order_id: int) -> str:
+    return f"{texts.plan_confirmed(order_id)}\n\n{_pending_text(order_id)}"
 
 
 def _alert(callback: AsyncMock) -> str:
@@ -165,9 +191,10 @@ async def test_confirm_moves_to_payment_pending(session: AsyncSession) -> None:
     callback = await _press(session, user, order_id, await _digest(session, order_id), bot)
 
     callback.answer.assert_awaited_once_with()
-    assert _sent(bot) == [texts.plan_confirmed(order_id)]
-    assert "Оплата пока недоступна" in _sent(bot)[0]
-    assert _actions(bot.send_message.await_args.kwargs["reply_markup"]) == ["cancel"]
+    assert _sent(bot) == [_confirmed_text(order_id)]
+    # Кредитов нет: «Пополнить баланс» вместо «Оплатить».
+    assert _actions(bot.send_message.await_args.kwargs["reply_markup"]) == ["menu", "cancel"]
+    assert (await fresh_order(session, order_id)).price == PRICE
     assert await _state(session, order_id) == (S.PAYMENT_PENDING, [VersionStatus.CONFIRMED])
 
 
@@ -353,9 +380,8 @@ async def test_payment_pending_reminder(session: AsyncSession) -> None:
 
     text, markup = await active_order_reminder(session, await fresh_order(session, order_id))
 
-    assert text == texts.payment_pending(order_id)
-    assert "Оплата пока недоступна" in text
-    assert _actions(markup) == ["cancel"]
+    assert text == _pending_text(order_id)
+    assert _actions(markup) == ["menu", "cancel"]
 
 
 async def test_start_in_payment_pending(session: AsyncSession) -> None:
@@ -365,7 +391,7 @@ async def test_start_in_payment_pending(session: AsyncSession) -> None:
     await cmd_start(message, AsyncMock(), await _user(session), session)
 
     greeting, reminder = _answers(message)
-    assert reminder == texts.payment_pending(order_id)
+    assert reminder == _pending_text(order_id)
 
 
 async def test_start_waiting_for_plan_confirmation_offers_confirm(session: AsyncSession) -> None:
@@ -389,7 +415,7 @@ async def test_new_report_does_not_create_order_over_active_one(
 
     await new_report(message, session, user)
 
-    expected = texts.payment_pending(order_id) if pending else "🗂 <b>План отчёта"
+    expected = _pending_text(order_id) if pending else "🗂 <b>План отчёта"
     assert _answers(message)[0].startswith(expected)
     count = await session.scalar(select(func.count()).where(Order.user_id == user.id))
     assert count == 1
@@ -401,7 +427,7 @@ async def test_text_in_payment_pending_reminds_without_changes(session: AsyncSes
 
     await answer_requirement(message, session, await _user(session))
 
-    assert _answers(message) == [texts.payment_pending(order_id)]
+    assert _answers(message) == [_pending_text(order_id)]
     assert await _state(session, order_id) == (S.PAYMENT_PENDING, [VersionStatus.CONFIRMED])
 
 
@@ -489,5 +515,5 @@ async def test_plan_callback_reaches_confirm_handler(
     assert isinstance(recorded, RecordingSession)
     assert any(isinstance(r, AnswerCallbackQuery) for r in recorded.requests)
     sent = [r.text for r in recorded.requests if isinstance(r, SendMessage)]
-    assert sent == [texts.plan_confirmed(order_id)]
+    assert sent == [_confirmed_text(order_id)]
     assert (await fresh_order(session, order_id)).status is S.PAYMENT_PENDING

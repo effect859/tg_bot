@@ -61,7 +61,7 @@ class User(TimestampMixin, Base):
     language_code: Mapped[str | None] = mapped_column(String(16))
     # Денормализованный кэш суммы balance_transactions.amount пользователя.
     # Источник истины — журнал balance_transactions; кэш меняется только
-    # в той же транзакции, что и запись в журнал. Единицы — копейки.
+    # в той же транзакции, что и запись в журнал (services.billing). Единицы — кредиты.
     balance: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     referrer_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     terms_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -100,6 +100,7 @@ class Order(TimestampMixin, Base):
         ),
         CheckConstraint("step_attempts >= 0", name="step_attempts_non_negative"),
         CheckConstraint(_step_running_predicate(), name="step_started_at_consistent"),
+        CheckConstraint("price IS NULL OR price > 0", name="price_positive"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -113,6 +114,7 @@ class Order(TimestampMixin, Base):
     failed_from_status: Mapped[OrderStatus | None] = mapped_column(
         _pg_enum(OrderStatus, "order_status")
     )
+    # Цена в кредитах: фиксируется при переходе в PAYMENT_PENDING и больше не меняется.
     price: Mapped[int | None] = mapped_column(Integer)
     # Прогресс шагов пайплайна — для возобновления генерации после сбоя.
     pipeline_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
@@ -381,20 +383,47 @@ class OrderFile(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+def _reason_consistent_predicate() -> str:
+    # Продублировано в миграции 0010: при изменении нужна миграция.
+    return (
+        "(reason <> 'topup' OR (amount > 0 AND payment_id IS NOT NULL AND order_id IS NULL))"
+        " AND (reason <> 'order_charge'"
+        " OR (amount < 0 AND order_id IS NOT NULL AND payment_id IS NULL))"
+        " AND (reason <> 'order_refund' OR (amount > 0 AND order_id IS NOT NULL))"
+    )
+
+
 class Payment(TimestampMixin, Base):
+    """Покупка кредитов за реальные деньги: строка = выставленный счёт.
+
+    Создаётся в PENDING при выставлении счёта (payload счёта ссылается на id строки) и
+    переводится в SUCCEEDED подтверждением провайдера — в той же транзакции, что и
+    зачисление кредитов (services.billing.confirm_topup). С заказами не связана.
+    """
+
     __tablename__ = "payments"
     __table_args__ = (
         # Идемпотентность: повторное уведомление провайдера не создаст второй платёж.
         UniqueConstraint("provider", "provider_payment_id"),
         CheckConstraint("amount > 0", name="amount_positive"),
+        CheckConstraint("credits > 0", name="credits_positive"),
+        # Подтверждённый платёж всегда хранит идентификатор провайдера (нужен для возврата).
+        CheckConstraint(
+            "status <> 'succeeded' OR provider_payment_id IS NOT NULL",
+            name="succeeded_has_provider_id",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     provider: Mapped[PaymentProvider] = mapped_column(_pg_enum(PaymentProvider, "payment_provider"))
+    # Telegram Stars: telegram_payment_charge_id (для refundStarPayment).
     provider_payment_id: Mapped[str | None] = mapped_column(String(255))
+    # Реальные деньги в минимальных единицах валюты провайдера (Stars — целые XTR).
     amount: Mapped[int] = mapped_column(Integer)
     currency: Mapped[str] = mapped_column(String(8))
+    # Сколько кредитов даёт этот платёж: фиксируется при выставлении счёта.
+    credits: Mapped[int] = mapped_column(Integer)
     status: Mapped[PaymentStatus] = mapped_column(
         _pg_enum(PaymentStatus, "payment_status"), default=PaymentStatus.PENDING
     )
@@ -407,6 +436,9 @@ class BalanceTransaction(Base):
     __tablename__ = "balance_transactions"
     __table_args__ = (
         CheckConstraint("amount <> 0", name="amount_non_zero"),
+        # Знак суммы и ссылки определяются причиной: пополнение — только по платежу,
+        # списание и возврат — только по заказу.
+        CheckConstraint(_reason_consistent_predicate(), name="reason_consistent"),
         # Не больше одного списания и одного возврата на заказ.
         Index(
             "uq_balance_transactions_order_id_reason",
@@ -415,11 +447,18 @@ class BalanceTransaction(Base):
             unique=True,
             postgresql_where=text("order_id IS NOT NULL"),
         ),
+        # Не больше одного зачисления на платёж.
+        Index(
+            "uq_balance_transactions_payment_id",
+            "payment_id",
+            unique=True,
+            postgresql_where=text("payment_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    # Положительное — зачисление, отрицательное — списание. Единицы — копейки.
+    # Положительное — зачисление, отрицательное — списание. Единицы — кредиты.
     amount: Mapped[int] = mapped_column(Integer)
     reason: Mapped[TransactionReason] = mapped_column(
         _pg_enum(TransactionReason, "transaction_reason")

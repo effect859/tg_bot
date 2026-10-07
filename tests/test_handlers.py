@@ -39,9 +39,11 @@ async def test_start_greets_and_shows_menu(session: AsyncSession) -> None:
 async def test_balance_is_formatted() -> None:
     message = AsyncMock()
 
-    await show_balance(message, User(tg_id=1, balance=150050))
+    await show_balance(message, User(tg_id=1, balance=1501))
 
-    assert "1500,50 ₽" in message.answer.await_args.args[0]
+    # Баланс — в кредитах, а не в рублях (Stage 3.6).
+    assert "1501 кредит" in message.answer.await_args.args[0]
+    assert "₽" not in message.answer.await_args.args[0]
 
 
 async def test_my_orders_empty(session: AsyncSession) -> None:
