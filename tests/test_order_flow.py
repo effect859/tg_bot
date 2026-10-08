@@ -73,8 +73,10 @@ def test_failed_before_payment_allows_retry_or_cancel_only() -> None:
         check_transition(S.FAILED, S.PAID, S.PREPARING_PLAN)
 
 
-def test_failed_after_payment_allows_retry_only() -> None:
-    assert allowed_transitions(S.FAILED, S.GENERATING) == {S.GENERATING}
+def test_failed_after_payment_allows_retry_or_refunded_cancel() -> None:
+    # Отмена после сбоя генерации — только с возвратом кредитов (Stage 3.7):
+    # это проверяет services.orders.change_status.
+    assert allowed_transitions(S.FAILED, S.GENERATING) == {S.GENERATING, S.CANCELLED}
     assert allowed_transitions(S.FAILED, S.REGENERATING) == {S.REGENERATING}
 
 

@@ -11,6 +11,7 @@ from app.domain.errors import (
     InvalidStatusTransitionError,
     OrderNotEditableError,
     OrderNotPaidError,
+    OrderNotRefundedError,
     OutdatedVersionError,
     PlanNotConfirmedError,
     RequirementsNotConfirmedError,
@@ -475,13 +476,16 @@ async def test_failed_before_payment_can_be_cancelled(session: AsyncSession) -> 
     assert order.failed_from_status is None
 
 
-async def test_failed_generation_retries_but_cannot_cancel(session: AsyncSession) -> None:
+async def test_failed_generation_retries_but_cannot_cancel_without_refund(
+    session: AsyncSession,
+) -> None:
     order = await _to_payment_pending(session, await _order(session))
     await pay_for_order(session, order.id)
     order = await _advance(session, order, S.FAILED)
     assert order.failed_from_status is S.GENERATING
 
-    with pytest.raises(InvalidStatusTransitionError):
+    # Отмена оплаченного заказа — только с возвратом кредитов (Stage 3.7).
+    with pytest.raises(OrderNotRefundedError):
         await svc.change_status(session, order.id, S.CANCELLED)
     order = await _advance(session, order, S.GENERATING, S.COMPLETED)
     assert order.status is S.COMPLETED

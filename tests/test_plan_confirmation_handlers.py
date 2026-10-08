@@ -446,9 +446,11 @@ async def test_cancel_payment_pending_then_new_report(session: AsyncSession) -> 
     assert _answers(message) == [texts.CONSENT_REQUEST]
 
 
-def test_help_does_not_promise_ready_docx() -> None:
-    assert "После оплаты вы получаете готовый DOCX" not in texts.HELP
-    assert "пока в разработке" in texts.HELP
+def test_help_describes_credits_payment_and_refund() -> None:
+    # Stage 3.7 (OD-4): оплата кредитами и возврат работают — «в разработке» нет.
+    assert "пока в разработке" not in texts.HELP
+    assert "кредитами" in texts.HELP and "Telegram Stars" in texts.HELP
+    assert "возвращаются на баланс" in texts.HELP
 
 
 # --- Маршрутизация --------------------------------------------------------------------

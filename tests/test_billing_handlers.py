@@ -645,7 +645,12 @@ async def test_reconciliation_registered_without_llm(
         async def stop(self) -> None:
             pass
 
-    for name in ("ReportCompletionRecovery", "ReportDeliveryRecovery", "PaymentReconciliation"):
+    for name in (
+        "ReportCompletionRecovery",
+        "ReportDeliveryRecovery",
+        "RefundRecovery",
+        "PaymentReconciliation",
+    ):
         monkeypatch.setattr(setup, name, Fake)
     dispatcher = _dispatcher(sessionmaker, tmp_path, monkeypatch)
     bot = AsyncMock()

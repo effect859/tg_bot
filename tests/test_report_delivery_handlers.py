@@ -409,6 +409,8 @@ async def test_delivery_recovery_registered_without_llm(
     monkeypatch.setattr(setup, "ReportDeliveryRecovery", Fake)
     # Сверка платежей (Stage 3.6) — тоже startup-проход; здесь не запускается.
     monkeypatch.setattr(setup, "PaymentReconciliation", Fake)
+    # Возврат кредитов (Stage 3.7) — тоже startup-проход; здесь не запускается.
+    monkeypatch.setattr(setup, "RefundRecovery", Fake)
     file_storage = LocalFileStorage(tmp_path)
     dispatcher = create_dispatcher(sessionmaker, MemoryStorage(), file_storage)
     bot = AsyncMock()
@@ -418,8 +420,8 @@ async def test_delivery_recovery_registered_without_llm(
     for handler in dispatcher.shutdown.handlers:
         await handler.callback()
 
-    assert len(created) == 3 == len(started)
-    completion, delivery, _reconciliation = created
+    assert len(created) == 4 == len(started)
+    completion, delivery, *_ = created
     assert completion == (sessionmaker, file_storage, ())
     sessions, storage, (send,) = delivery
     assert (sessions, storage) == (sessionmaker, file_storage)

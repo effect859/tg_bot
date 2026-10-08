@@ -78,6 +78,11 @@ def allowed_transitions(
     targets = {failed_from}
     if failed_from in PRE_PAYMENT_STATUSES:
         targets.add(S.CANCELLED)
+    elif failed_from is S.GENERATING:
+        # Сбой генерации после оплаты: отмена — только вместе с возвратом кредитов
+        # (это проверяет services.orders.change_status, возврат делает
+        # services.billing.refund_failed_order).
+        targets.add(S.CANCELLED)
     return frozenset(targets)
 
 

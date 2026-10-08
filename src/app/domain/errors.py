@@ -52,6 +52,18 @@ class OrderNotPaidError(OrderDomainError):
         self.order_id = order_id
 
 
+class OrderNotRefundedError(InvalidStatusTransitionError):
+    """Отмена оплаченного заказа без возврата кредитов (строки ORDER_REFUND) недопустима.
+
+    Подкласс InvalidStatusTransitionError: для хендлеров это обычный отказ в переходе
+    («действие неактуально»), например у старой кнопки «Отменить» после сбоя генерации.
+    """
+
+    def __init__(self, order_id: int) -> None:
+        super().__init__(OrderStatus.FAILED, OrderStatus.CANCELLED)
+        self.order_id = order_id
+
+
 class DraftVersionExistsError(OrderDomainError):
     """У заказа уже есть черновик версии: его нужно подтвердить или отредактировать."""
 

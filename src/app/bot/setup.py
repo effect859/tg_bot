@@ -21,8 +21,10 @@ from app.bot.stars import fetch_star_transactions
 from app.domain.plan import PlanOutcome
 from app.extraction.base import TextExtractor
 from app.llm.base import LLMClient
+from app.services.billing import RefundOutcome
 from app.services.material_processing import ProcessingOutcome
 from app.services.material_recovery import MaterialRecovery
+from app.services.order_refunds import RefundRecovery
 from app.services.payment_reconciliation import PaymentReconciliation
 from app.services.periodic import PeriodicPass
 from app.services.plan_generation import PlanRecovery
@@ -89,6 +91,10 @@ def create_dispatcher(
             sessionmaker, file_storage, partial(send_report_document, bot)
         ),
     )
+    # Возврат кредитов за сбой генерации после оплаты; уведомление — после commit.
+    _run_while_polling(
+        dispatcher, lambda bot: RefundRecovery(sessionmaker, partial(notify_refund_outcome, bot))
+    )
     # Сверка платежей Stars: зачисляет кредиты, если successful_payment не обработан.
     _run_while_polling(
         dispatcher,
@@ -131,6 +137,12 @@ async def notify_analysis_outcome(bot: Bot, chat_id: int, outcome: AnalysisOutco
     if reply is not None:
         text, markup = reply
         await bot.send_message(chat_id, text, reply_markup=markup)
+
+
+async def notify_refund_outcome(bot: Bot, chat_id: int, outcome: RefundOutcome) -> None:
+    """Сообщение о возврате кредитов: только после commit возврата (best-effort)."""
+    balance = outcome.balance if outcome.balance is not None else 0
+    await bot.send_message(chat_id, texts.order_refunded(outcome.order_id, outcome.amount, balance))
 
 
 async def notify_plan_outcome(bot: Bot, chat_id: int, outcome: PlanOutcome) -> None:

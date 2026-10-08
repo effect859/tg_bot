@@ -91,6 +91,11 @@ async def active_order_reminder(session: AsyncSession, order: Order) -> Reply:
             return texts.plan_view(order_id, plan), markup
         case S.PAYMENT_PENDING:
             return await payment_reply(session, order.id, order.user_id, order.price)
+        case S.GENERATING:
+            return texts.generation_in_progress(order.id), None
+        case S.FAILED if order.failed_from_status is S.GENERATING:
+            # Возврат кредитов и отмену выполнит RefundRecovery (services.order_refunds).
+            return texts.generation_failed(order.id), None
         case _:
             return texts.active_order_exists(order), None
 

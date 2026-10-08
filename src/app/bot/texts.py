@@ -315,7 +315,11 @@ HELP = (
     "<b>Как это работает</b>\n"
     "1. Вы присылаете задание на практику и отвечаете на пару вопросов.\n"
     "2. Бот бесплатно составляет план отчёта.\n"
-    "3. Оплата и готовый DOCX, оформленный по ГОСТу, пока в разработке.\n\n"
+    "3. После подтверждения плана заказ оплачивается кредитами — их можно купить "
+    f"за Telegram Stars в разделе «{BTN_BALANCE}».\n"
+    "4. Бот готовит отчёт и присылает DOCX, оформленный по ГОСТу; скачать его снова "
+    f"можно в «{BTN_MY_ORDERS}».\n"
+    "5. Если подготовить отчёт не удалось, кредиты автоматически возвращаются на баланс.\n\n"
     "Команды: /start — главное меню, /help — эта справка."
 )
 
@@ -403,6 +407,25 @@ def payment_pending(order_id: int, price: int, balance_now: int) -> str:
 
 def insufficient_credits(price: int, balance_now: int) -> str:
     return f"Недостаточно кредитов: нужно {credits(price)}, на балансе {credits(balance_now)}."
+
+
+def generation_in_progress(order_id: int) -> str:
+    return f"Отчёт по заказу #{order_id} готовится. Пришлём файл, как только он будет готов."
+
+
+def generation_failed(order_id: int) -> str:
+    return (
+        f"Не удалось подготовить отчёт по заказу #{order_id}. "
+        "Кредиты за заказ вернутся на баланс автоматически в течение минуты."
+    )
+
+
+def order_refunded(order_id: int, amount: int, balance_after: int) -> str:
+    return (
+        f"Не удалось подготовить отчёт по заказу #{order_id}, заказ отменён. "
+        f"Возвращено {credits(amount)}, на балансе {credits(balance_after)}.\n\n"
+        f"Можно оформить новый заказ: «{BTN_NEW_REPORT}»."
+    )
 
 
 def order_paid(order_id: int, price: int, balance_after: int) -> str:

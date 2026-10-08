@@ -9,6 +9,9 @@
 2. Оплата заказа — внутренняя операция. pay_order в одной транзакции списывает цену
    заказа (ORDER_CHARGE + users.balance) и переводит заказ
    PAYMENT_PENDING → PAID → GENERATING. Блокировки: пользователь → заказ.
+3. Возврат за сбой генерации после оплаты. refund_failed_order в одной транзакции
+   возвращает фактическое списание (ORDER_REFUND + users.balance) и переводит заказ
+   FAILED → CANCELLED. Блокировки: пользователь → заказ.
 
 Единый порядок блокировок: платёж → пользователь → заказ. Пользователь раньше заказа —
 как у любого апдейта бота: UserMiddleware в начале транзакции обновляет строку
@@ -296,6 +299,76 @@ async def pay_order(session: AsyncSession, user_id: int, order_id: int) -> Charg
     return ChargeOutcome(ChargeOutcomeKind.PAID, order_id, price, balance - price)
 
 
+# --- Возврат за неудавшийся заказ -----------------------------------------------------
+
+
+class RefundOutcomeKind(StrEnum):
+    # Кредиты возвращены, заказ отменён.
+    REFUNDED = "refunded"
+    # Возврат по заказу уже есть: повтор ничего не меняет.
+    ALREADY_REFUNDED = "already_refunded"
+    # Не сбой генерации после оплаты, нет списания или заказа нет.
+    SKIPPED = "skipped"
+
+
+@dataclass(frozen=True)
+class RefundOutcome:
+    kind: RefundOutcomeKind
+    order_id: int
+    amount: int = 0
+    balance: int | None = None
+    # Кому сообщить о возврате (Telegram id владельца заказа); только для REFUNDED.
+    chat_id: int | None = None
+
+
+async def refund_failed_order(session: AsyncSession, order_id: int) -> RefundOutcome:
+    """Сбой генерации после оплаты: ORDER_REFUND + баланс + FAILED → CANCELLED, один commit.
+
+    Сумма возврата — фактическое списание (ORDER_CHARGE), а не orders.price.
+    Блокировки — пользователь, затем заказ (как у pay_order). Без списания заказ не
+    отменяется и ничего не возвращается: только logger.error.
+    """
+    user_id = await session.scalar(select(Order.user_id).where(Order.id == order_id))
+    if user_id is None:
+        await session.rollback()
+        return RefundOutcome(RefundOutcomeKind.SKIPPED, order_id)
+    user = await _lock_user(session, user_id)
+    order = await lock_order(session, order_id)
+    if order.status is not S.FAILED or order.failed_from_status is not S.GENERATING:
+        await session.rollback()
+        return RefundOutcome(RefundOutcomeKind.SKIPPED, order_id)
+    if await _transaction(session, order_id, TransactionReason.ORDER_REFUND) is not None:
+        # Возврат и CANCELLED пишутся одним commit: штатно сюда не попасть.
+        logger.error("Failed order already refunded but not cancelled: order_id=%s", order_id)
+        await session.rollback()
+        return RefundOutcome(RefundOutcomeKind.ALREADY_REFUNDED, order_id)
+    charge = await _transaction(session, order_id, TransactionReason.ORDER_CHARGE)
+    if charge is None:
+        logger.error("Failed paid order has no credit charge: order_id=%s", order_id)
+        await session.rollback()
+        return RefundOutcome(RefundOutcomeKind.SKIPPED, order_id)
+
+    amount = -charge.amount
+    session.add(
+        BalanceTransaction(
+            user_id=user_id,
+            amount=amount,
+            reason=TransactionReason.ORDER_REFUND,
+            order_id=order_id,
+        )
+    )
+    user.balance += amount
+    outcome = RefundOutcome(
+        RefundOutcomeKind.REFUNDED, order_id, amount, balance=user.balance, chat_id=user.tg_id
+    )
+    await session.flush()
+    # change_status(CANCELLED) проверяет, что возврат есть.
+    await change_status(session, order_id, S.CANCELLED)
+    await session.commit()
+    logger.info("Failed order refunded: order_id=%s amount=%s", order_id, amount)
+    return outcome
+
+
 # --- Чтение ---------------------------------------------------------------------------
 
 
@@ -328,6 +401,16 @@ async def _lock_user(session: AsyncSession, user_id: int) -> User:
     if user is None:  # FK payments.user_id / orders.user_id: невозможно
         raise LookupError(f"User {user_id} not found")
     return user
+
+
+async def _transaction(
+    session: AsyncSession, order_id: int, reason: TransactionReason
+) -> BalanceTransaction | None:
+    """Проводка заказа с причиной reason: их не больше одной (UNIQUE(order_id, reason))."""
+    stmt = select(BalanceTransaction).where(
+        BalanceTransaction.order_id == order_id, BalanceTransaction.reason == reason
+    )
+    return await session.scalar(stmt)
 
 
 async def _has_charge(session: AsyncSession, order_id: int) -> bool:

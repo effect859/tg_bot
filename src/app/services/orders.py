@@ -23,6 +23,7 @@ from app.domain.errors import (
     OrderNotEditableError,
     OrderNotFoundError,
     OrderNotPaidError,
+    OrderNotRefundedError,
     OutdatedVersionError,
     PlanNotConfirmedError,
     RequirementsNotConfirmedError,
@@ -105,6 +106,14 @@ async def change_status(
     if target is OrderStatus.PAID:
         # Оплата — только списанием кредитов (services.billing.pay_order).
         await _require_order_charge(session, order_id)
+    if (
+        target is OrderStatus.CANCELLED
+        and order.status is OrderStatus.FAILED
+        and order.failed_from_status not in PRE_PAYMENT_STATUSES
+    ):
+        # Отмена после оплаты — только с возвратом кредитов
+        # (services.billing.refund_failed_order, в той же транзакции).
+        await _require_order_refund(session, order_id)
 
     async with _guard_active_order(order.user_id), session.begin_nested():
         if target is OrderStatus.FAILED:
@@ -339,6 +348,17 @@ async def _require_order_charge(session: AsyncSession, order_id: int) -> None:
     )
     if not await session.scalar(stmt):
         raise OrderNotPaidError(order_id)
+
+
+async def _require_order_refund(session: AsyncSession, order_id: int) -> None:
+    stmt = select(
+        exists().where(
+            BalanceTransaction.order_id == order_id,
+            BalanceTransaction.reason == TransactionReason.ORDER_REFUND,
+        )
+    )
+    if not await session.scalar(stmt):
+        raise OrderNotRefundedError(order_id)
 
 
 async def _require_confirmed_plan(session: AsyncSession, order_id: int) -> OrderPlanVersion:
