@@ -1,0 +1,84 @@
+# Production-стек: PostgreSQL, Redis, одноразовая миграция и бот.
+#
+#   docker compose -f docker-compose.prod.yml --env-file /путь/к/prod.env up -d --build
+#
+# Отличие от docker-compose.yml (разработка): наружу не публикуется ни один порт,
+# паролей по умолчанию нет — всё обязательное берётся из окружения (${VAR:?}), бот и
+# миграция работают в контейнерах из одного образа (Dockerfile, стадия runtime).
+# Бэкапы БД и хранилища — отдельный будущий этап (см. README).
+
+name: tg-bot
+
+x-app-environment: &app-environment
+  BOT_TOKEN: ${BOT_TOKEN:?BOT_TOKEN is required}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is required}
+  LLM_MODEL: ${LLM_MODEL:-claude-sonnet-5-5}
+  # Пароль в URL должен быть URL-кодирован, если в нём есть спецсимволы.
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tg_bot}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-tg_bot}
+  REDIS_URL: redis://redis:6379/0
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  STORAGE_DIR: /app/var/storage
+  EXTRACTION_MEMORY_LIMIT_MIB: ${EXTRACTION_MEMORY_LIMIT_MIB:-1024}
+  HEARTBEAT_PATH: /app/var/heartbeat
+  HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-30}
+  HEARTBEAT_MAX_AGE_SECONDS: ${HEARTBEAT_MAX_AGE_SECONDS:-120}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tg_bot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-tg_bot}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Одноразово: схема до head. Бот стартует только после успешного завершения.
+  migrate:
+    build:
+      context: .
+      target: runtime
+    image: tg-bot:runtime
+    command: ["alembic", "upgrade", "head"]
+    environment: *app-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  bot:
+    image: tg-bot:runtime
+    environment: *app-environment
+    volumes:
+      - bot_storage:/app/var/storage
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  bot_storage:

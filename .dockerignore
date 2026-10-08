@@ -1,0 +1,24 @@
+# Белый список: в контекст сборки попадает только то, что нужно образу.
+*
+!pyproject.toml
+!README.md
+!alembic.ini
+!alembic/
+!src/
+# Только для стадии test (в runtime-образ не копируется).
+!tests/
+
+# Явно исключено, даже если окажется внутри разрешённых каталогов.
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+**/.pytest_cache/
+**/.ruff_cache/
+.git
+.venv
+.env
+.env.*
+var/
+htmlcov/
+.coverage
+stage_2_3_full_diff.txt

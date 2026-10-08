@@ -89,6 +89,67 @@ docker run --rm --network tg_bot_default -v "$PWD:/src:ro" python:3.12-slim bash
   TEST_DATABASE_URL=postgresql+asyncpg://tg_bot:tg_bot@postgres:5432/tg_bot_test pytest -q'
 ```
 
+## Production Packaging & Runtime
+
+Сборка и запуск бота в Linux-контейнерах (`Dockerfile`, `docker-compose.prod.yml`).
+Это упаковка: запуск с реальными Telegram- и Anthropic-ключами — отдельный этап.
+
+**Образ** (`Dockerfile`, Python 3.12-slim, пользователь `app`, не root):
+
+```bash
+docker build --target runtime -t tg-bot:runtime .   # production
+docker build --target test -t tg-bot:test .         # полный pytest в Linux
+```
+
+В образ попадают только `pyproject.toml`, `README.md`, `alembic.ini`, `alembic/`,
+`src/` (и `tests/` — только в стадию test): остальное отсекает `.dockerignore`, в том
+числе `.env`, `.git`, `.venv`, `var/`. Секретов в образе нет.
+
+**Production-стек** (`docker-compose.prod.yml`): `postgres`, `redis`, одноразовый
+`migrate` (`alembic upgrade head`) и `bot`. Бот стартует только после успешного
+завершения `migrate`; если миграция упала, бот не запускается.
+
+```bash
+docker compose -f docker-compose.prod.yml --env-file /путь/к/prod.env up -d --build
+```
+
+- **Окружение.** Обязательны `BOT_TOKEN`, `ANTHROPIC_API_KEY`, `POSTGRES_PASSWORD` —
+  без них `docker compose` не соберёт конфигурацию. По желанию: `POSTGRES_USER`,
+  `POSTGRES_DB`, `LLM_MODEL`, `LOG_LEVEL`, `EXTRACTION_MEMORY_LIMIT_MIB`,
+  `HEARTBEAT_INTERVAL_SECONDS`, `HEARTBEAT_MAX_AGE_SECONDS`. `DATABASE_URL` и `REDIS_URL`
+  собирает compose-файл (пароль со спецсимволами в URL нужно URL-кодировать).
+- **Тома.** `postgres_data` (БД), `redis_data` (FSM диалогов), `bot_storage`
+  (`/app/var/storage`: материалы и готовые отчёты).
+- **Сеть.** Наружу не публикуется ни один порт: PostgreSQL и Redis доступны только
+  контейнерам стека. Бот работает через polling — входящих соединений не нужно.
+- **Проверка схемы.** Перед polling бот сравнивает ревизию БД с head миграций
+  (`app/db/schema.py`, только чтение). При несовпадении — ошибка в лог («run `alembic
+  upgrade head`») и выход с кодом 1; миграции сам бот не выполняет.
+- **Healthcheck.** Бот раз в `HEARTBEAT_INTERVAL_SECONDS` выполняет `SELECT 1` и
+  атомарно обновляет метку `HEARTBEAT_PATH` (`app/services/heartbeat.py`; в метке только
+  время). Docker `HEALTHCHECK` запускает `python -m app.healthcheck`: код 0 — метка
+  свежее `HEARTBEAT_MAX_AGE_SECONDS`, 1 — устарела, повреждена или её нет (процесс
+  завис или БД недоступна). Healthcheck не требует БД, Redis и сети.
+- **Отличие от `docker-compose.yml`.** Dev-файл поднимает только PostgreSQL и Redis на
+  `127.0.0.1` с паролем `tg_bot` и базой для тестов; бот при разработке запускается
+  из venv (см. «Локальный запуск»). Dev-файл не меняется.
+- **Бэкапы.** Резервное копирование и восстановление БД и хранилища не реализованы —
+  отдельный будущий этап.
+
+**Тесты в Linux.** Стадия test запускает полный pytest в Linux (в том числе тесты,
+которые на Windows пропускаются, например лимит памяти `RLIMIT_AS`). База — PostgreSQL
+из `docker-compose.yml`; контейнер подключается к сети dev-стека напрямую:
+
+```bash
+docker compose up -d
+docker run --rm --network tg_bot_default \
+  -e TEST_DATABASE_URL=postgresql+asyncpg://tg_bot:tg_bot@postgres:5432/tg_bot_test tg-bot:test
+```
+
+Не используйте `host.docker.internal`: тесты открывают тысячи коротких соединений, и
+через NAT Docker Desktop подключения изредка не устанавливаются за 60 с. Linux-прогон
+и обычный pytest на хосте нельзя запускать одновременно — у них общая база.
+
 ## Извлечение текста из материалов
 
 После приёма файла бот в том же апдейте извлекает из него текст и сообщает

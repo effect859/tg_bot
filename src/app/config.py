@@ -1,8 +1,14 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.healthcheck import (
+    DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
+    DEFAULT_HEARTBEAT_PATH,
+)
 
 
 class Settings(BaseSettings):
@@ -27,6 +33,18 @@ class Settings(BaseSettings):
     # не запускается: см. require_llm_api_key.
     anthropic_api_key: SecretStr | None = None
     llm_model: str = "claude-sonnet-5-5"
+
+    # Heartbeat: метка живости для Docker HEALTHCHECK (python -m app.healthcheck).
+    heartbeat_path: Path = DEFAULT_HEARTBEAT_PATH
+    heartbeat_interval_seconds: float = Field(default=DEFAULT_HEARTBEAT_INTERVAL_SECONDS, gt=0)
+    heartbeat_max_age_seconds: float = Field(default=DEFAULT_HEARTBEAT_MAX_AGE_SECONDS, gt=0)
+
+    @model_validator(mode="after")
+    def _check_heartbeat(self) -> "Settings":
+        # Метка обновляется раз в interval: допустимый возраст не может быть меньше.
+        if self.heartbeat_max_age_seconds < self.heartbeat_interval_seconds:
+            raise ValueError("HEARTBEAT_MAX_AGE_SECONDS must be >= HEARTBEAT_INTERVAL_SECONDS")
+        return self
 
 
 class ConfigurationError(Exception):
