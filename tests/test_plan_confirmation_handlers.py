@@ -39,6 +39,7 @@ from app.bot.setup import create_dispatcher
 from app.db.models import Order, OrderPlanVersion, User
 from app.domain.billing import order_price
 from app.domain.enums import DocType, OrderStatus, VersionStatus
+from app.domain.plan import MAX_SECTION_PAGES
 from app.domain.requirements_dialog import content_digest
 from app.services import orders
 from app.services.plan_generation import generate_plan
@@ -271,6 +272,34 @@ async def test_missing_draft_is_technical_error(
     assert _alert(callback) == texts.PLAN_CONFIRM_FAILED
     assert (
         f"Plan confirmation refused: order_id={order_id} error=VersionNotFoundError" in caplog.text
+    )
+
+
+async def test_oversized_section_is_technical_error(
+    session: AsyncSession, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Черновик, сохранённый в обход validate_plan: до оплаты не доходит."""
+    user = await _user(session)
+    order_id = await _planned_order(session)
+    [draft] = await orders.get_plan_versions(session, order_id)
+    content = dict(draft.content)
+    content["sections"] = [dict(s) for s in content["sections"]]
+    content["sections"][0]["target_pages"] = MAX_SECTION_PAGES + 1
+    await session.execute(
+        update(OrderPlanVersion).where(OrderPlanVersion.id == draft.id).values(content=content)
+    )
+    await session.commit()
+
+    callback = await _press(session, user, order_id, content_digest(content))
+
+    assert _alert(callback) == texts.PLAN_CONFIRM_FAILED
+    assert (
+        f"Plan confirmation refused: order_id={order_id} error=PlanSectionTooLargeError"
+        in caplog.text
+    )
+    assert await _state(session, order_id) == (
+        S.WAITING_FOR_PLAN_CONFIRMATION,
+        [VersionStatus.DRAFT],
     )
 
 

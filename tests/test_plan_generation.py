@@ -22,6 +22,8 @@ from app.domain.enums import LLMCallStatus, OrderStatus, VersionStatus
 from app.domain.errors import InvalidStatusTransitionError, PlanLimitReachedError
 from app.domain.plan import (
     MAX_PLAN_LLM_CALLS,
+    MAX_SECTION_PAGES,
+    MAX_SECTIONS,
     NOT_FOR_PLAN,
     PLAN_JSON_SCHEMA,
     PlanOutcome,
@@ -161,14 +163,16 @@ async def test_numbered_titles_saved_without_numbers_and_without_retry(
     session: AsyncSession,
 ) -> None:
     order_id = await preparing_order(session)
+    # Сумма 25 — объём ТЗ FULL; каждый раздел не больше MAX_SECTION_PAGES (8).
     numbered = plan_result(
-        section("1. Введение", 2),
+        section("1. Введение", 3),
         section(
             "2. Основная часть",
             8,
             subsections=[subsection("2.1. Сведения", 3), subsection("2.2 Структура", 5)],
         ),
-        section("3) Заключение", 2),
+        section("3) Анализ", 8),
+        section("4. Заключение", 6),
     )
     llm = FakeLLMClient(numbered)
 
@@ -177,7 +181,7 @@ async def test_numbered_titles_saved_without_numbers_and_without_retry(
     assert outcome.kind is K.COMPLETED
     [plan] = await _plans(session, order_id)
     sections = plan.content["sections"]
-    assert [s["title"] for s in sections] == ["Введение", "Основная часть", "Заключение"]
+    assert [s["title"] for s in sections] == ["Введение", "Основная часть", "Анализ", "Заключение"]
     assert [s["title"] for s in sections[1]["subsections"]] == ["Сведения", "Структура"]
     assert plan.content == outcome.plan
     # Нормализация — не повод для повтора: один вызов, учтён как успешный.
@@ -191,19 +195,23 @@ async def test_plan_view_of_numbered_response_has_no_double_numbers(
 ) -> None:
     """Регрессия M1: пользователь видит «1. Введение», а не «1. 1. Введение»."""
     order_id = await preparing_order(session)
+    # Сумма 25 — объём ТЗ FULL; каждый раздел не больше MAX_SECTION_PAGES (8).
     numbered = plan_result(
-        section("1. Введение", 2),
+        section("1. Введение", 3),
         section("2. Основная часть", 8, subsections=[subsection("2.1. Сведения", 3)]),
-        section("3. Заключение", 2),
+        section("3. Анализ", 8),
+        section("4. Заключение", 6),
     )
-    await generate_plan(session, FakeLLMClient(numbered), order_id)
+    outcome = await generate_plan(session, FakeLLMClient(numbered), order_id)
+    assert outcome.kind is K.COMPLETED
     [plan] = await _plans(session, order_id)
 
     view = texts.plan_view(order_id, plan.content)
 
-    for line in ("1. Введение", "2. Основная часть", "2.1. Сведения", "3. Заключение"):
+    lines = ("1. Введение", "2. Основная часть", "2.1. Сведения", "3. Анализ", "4. Заключение")
+    for line in lines:
         assert line in view
-    for doubled in ("1. 1.", "2. 2.", "2.1. 2.1.", "3. 3."):
+    for doubled in ("1. 1.", "2. 2.", "2.1. 2.1.", "3. 3.", "4. 4."):
         assert doubled not in view
 
 
@@ -251,8 +259,8 @@ async def test_requirements_without_target_keep_model_pages(session: AsyncSessio
     await generate_plan(session, FakeLLMClient(GOOD_PLAN), order_id)
 
     [plan] = await _plans(session, order_id)
-    assert [s["target_pages"] for s in plan.content["sections"]] == [2, 8, 10, 2]
-    assert plan.content["total_pages"] == 22
+    assert [s["target_pages"] for s in plan.content["sections"]] == [3, 8, 8, 6]
+    assert plan.content["total_pages"] == 25
 
 
 async def test_existing_plan_draft_is_updated(session: AsyncSession) -> None:
@@ -356,6 +364,75 @@ async def test_more_sections_than_target_pages_is_retried_as_invalid_response(
     assert await _plans(session, order_id) == []
     calls = await _calls(session, order_id)
     assert [(c.status, c.error) for c in calls] == [(LLMCallStatus.ERROR, "invalid_response")] * 3
+
+
+# Ответ модели, где после распределения 25 страниц ТЗ раздел больше MAX_SECTION_PAGES:
+# [2, 8, 10, 2] -> [2, 9, 12, 2].
+OVERSIZED_PLAN = plan_result(
+    section("Введение", 2), section("А", 8), section("Б", 10), section("Заключение", 2)
+)
+
+
+@pytest.mark.parametrize("target_pages", [25, None])
+async def test_oversized_section_is_retried_as_invalid_response(
+    session: AsyncSession, target_pages: int | None
+) -> None:
+    """Раздел больше предела генератора: черновика нет, повтор, затем верный план."""
+    order_id = await preparing_order(
+        session, content={**REQUIREMENTS, "target_pages": target_pages}
+    )
+    oversized = (
+        OVERSIZED_PLAN
+        if target_pages is not None
+        else plan_result(section("А", MAX_SECTION_PAGES + 1), section("Б", 1), section("В", 1))
+    )
+    llm = FakeLLMClient(oversized, GOOD_PLAN)
+
+    first = await generate_plan(session, llm, order_id)
+
+    assert (first.kind, first.error_code) == (K.RETRY_LATER, "invalid_response")
+    order = await _fresh(session, order_id)
+    assert (order.status, order.step_started_at) == (S.PREPARING_PLAN, None)
+    assert await _plans(session, order_id) == []
+
+    second = await generate_plan(session, llm, order_id)
+
+    assert second.kind is K.COMPLETED
+    assert (await _fresh(session, order_id)).status is S.WAITING_FOR_PLAN_CONFIRMATION
+    [plan] = await _plans(session, order_id)
+    assert plan.status is VersionStatus.DRAFT
+    assert all(s["target_pages"] <= MAX_SECTION_PAGES for s in plan.content["sections"])
+    calls = await _calls(session, order_id)
+    assert [(c.status, c.error) for c in calls] == [
+        (LLMCallStatus.ERROR, "invalid_response"),
+        (LLMCallStatus.SUCCESS, None),
+    ]
+
+
+async def test_oversized_section_three_times_leads_to_failed(session: AsyncSession) -> None:
+    order_id = await preparing_order(session)  # ТЗ FULL: 25 страниц
+    llm = FakeLLMClient(OVERSIZED_PLAN)
+
+    outcomes = [await generate_plan(session, llm, order_id) for _ in range(3)]
+
+    assert [(o.kind, o.error_code) for o in outcomes] == [
+        (K.RETRY_LATER, "invalid_response"),
+        (K.RETRY_LATER, "invalid_response"),
+        (K.FAILED, "invalid_response"),
+    ]
+    assert outcomes[-1].can_retry
+    order = await _fresh(session, order_id)
+    assert (order.status, order.failed_from_status) == (S.FAILED, S.PREPARING_PLAN)
+    assert order.error == "plan_generation: invalid_response"
+    assert await _plans(session, order_id) == []
+
+
+def test_prompt_states_section_page_limit() -> None:
+    prompt = " ".join(service.PLAN_PROMPT.split())
+
+    assert f"не больше {MAX_SECTION_PAGES} страниц" in prompt
+    assert "сумма target_pages разделов должна быть равна ему" in prompt
+    assert f"увеличь число разделов (не больше {MAX_SECTIONS})" in prompt
 
 
 async def test_target_pages_equal_to_section_count_is_accepted(session: AsyncSession) -> None:

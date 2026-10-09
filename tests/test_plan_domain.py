@@ -7,14 +7,19 @@ from typing import Any
 import pytest
 
 from app.domain import plan as domain
+from app.domain import report_generation
 from app.domain.plan import (
+    MAX_PAGE_WEIGHT,
     MAX_PLAN_ATTEMPTS,
     MAX_PLAN_LLM_CALLS,
+    MAX_SECTION_PAGES,
+    MAX_SECTIONS,
     NOT_FOR_PLAN,
     PLAN_JSON_SCHEMA,
     PLAN_REQUIREMENT_FIELDS,
     InvalidPlanResponse,
     distribute_pages,
+    oversized_sections,
     plan_requirements,
     validate_plan,
 )
@@ -110,8 +115,8 @@ def test_limits() -> None:
 def test_valid_plan_without_target_keeps_model_pages() -> None:
     plan = validate_plan(plan_payload(), None)
 
-    assert [s["target_pages"] for s in plan["sections"]] == [2, 8, 10, 2]
-    assert plan["total_pages"] == 22
+    assert [s["target_pages"] for s in plan["sections"]] == [3, 8, 8, 6]
+    assert plan["total_pages"] == 25
     second = plan["sections"][1]
     assert second["requirements"] == ["Описать структуру отдела продаж"]
     assert [s["title"] for s in second["subsections"]] == ["Общие сведения", "Структура"]
@@ -122,10 +127,10 @@ def test_valid_plan_without_target_keeps_model_pages() -> None:
 
 
 def test_target_pages_are_distributed_exactly() -> None:
-    plan = validate_plan(plan_payload(), 30)
+    plan = validate_plan(plan_payload(), 20)
 
     pages = [s["target_pages"] for s in plan["sections"]]
-    assert sum(pages) == plan["total_pages"] == 30
+    assert sum(pages) == plan["total_pages"] == 20
     assert all(p >= 1 for p in pages)
     # Подразделы — внутри страниц раздела.
     second = plan["sections"][1]
@@ -268,7 +273,7 @@ def test_boundary_lengths_accepted() -> None:
     payload = plan_payload(
         section(
             "x" * 200,
-            500,
+            MAX_SECTION_PAGES,
             description="d" * 1000,
             requirements=["r" * 300] * 10,
         ),
@@ -278,7 +283,16 @@ def test_boundary_lengths_accepted() -> None:
 
     plan = validate_plan(payload, None)
 
-    assert plan["sections"][0]["target_pages"] == 500
+    assert plan["sections"][0]["target_pages"] == MAX_SECTION_PAGES
+
+
+def test_boundary_page_weight_accepted_with_target() -> None:
+    """Сырое число от модели до MAX_PAGE_WEIGHT — вес: с объёмом ТЗ он масштабируется."""
+    payload = plan_payload(section("А", MAX_PAGE_WEIGHT), section("Б", 1), section("В", 1))
+
+    plan = validate_plan(payload, 3)
+
+    assert [s["target_pages"] for s in plan["sections"]] == [1, 1, 1]
 
 
 # --- Номер в названии (Stage 2.9.1, M1) ----------------------------------------------
@@ -496,9 +510,9 @@ def test_plan_at_boundary_gives_one_page_each() -> None:
 
 def test_subsection_pages_dropped_when_section_too_small() -> None:
     subs = [subsection("П1", 2), subsection("П2", 2), subsection("П3", 2)]
-    payload = plan_payload(section("А", 1, subsections=subs), section("Б", 9), section("В", 10))
+    payload = plan_payload(section("А", 1, subsections=subs), section("Б", 7), section("В", 8))
 
-    plan = validate_plan(payload, 20)
+    plan = validate_plan(payload, 16)
 
     first = plan["sections"][0]
     assert first["target_pages"] == 1
@@ -506,7 +520,7 @@ def test_subsection_pages_dropped_when_section_too_small() -> None:
 
 
 def test_validation_is_deterministic() -> None:
-    assert validate_plan(plan_payload(), 37) == validate_plan(plan_payload(), 37)
+    assert validate_plan(plan_payload(), 23) == validate_plan(plan_payload(), 23)
 
 
 def test_distribution_sum_exact_over_many_inputs() -> None:
@@ -530,3 +544,93 @@ def test_distribution_sum_exact_over_many_inputs() -> None:
         assert sum(pages) == total
         assert min(pages) >= 1
         assert len(pages) == count
+
+
+# --- Предел раздела генератора (Stage 3.9, S1) ---------------------------------------
+# Раздел больше MAX_SECTION_PAGES генератор не пишет: такой план не принимается, иначе
+# он доходит до оплаты и падает уже в генерации.
+
+
+def test_section_limit_is_generator_limit() -> None:
+    assert MAX_SECTION_PAGES is report_generation.MAX_SECTION_PAGES
+    assert MAX_SECTION_PAGES == 8
+    assert MAX_PAGE_WEIGHT == 500
+
+
+@pytest.mark.parametrize("target", [None, 3 * MAX_SECTION_PAGES])
+def test_sections_of_max_pages_are_accepted(target: int | None) -> None:
+    payload = plan_payload(*(section(name, MAX_SECTION_PAGES) for name in "АБВ"))
+
+    plan = validate_plan(payload, target)
+
+    assert [s["target_pages"] for s in plan["sections"]] == [MAX_SECTION_PAGES] * 3
+    assert plan["total_pages"] == 3 * MAX_SECTION_PAGES
+
+
+def test_section_over_max_pages_without_target_is_invalid() -> None:
+    payload = plan_payload(section("А", MAX_SECTION_PAGES + 1), section("Б", 1), section("В", 1))
+
+    with pytest.raises(InvalidPlanResponse):
+        validate_plan(payload, None)
+
+
+@pytest.mark.parametrize("oversized", [0, 2, 4])
+def test_one_oversized_section_among_several_is_invalid(oversized: int) -> None:
+    pages: list[int | None] = [3, None, 8, 1, 5]
+    pages[oversized] = MAX_SECTION_PAGES + 1
+    payload = plan_payload(*(section(f"Раздел {i}", p) for i, p in enumerate(pages)))
+
+    with pytest.raises(InvalidPlanResponse):
+        validate_plan(payload, None)
+
+
+def test_skewed_weights_distributed_over_limit_are_invalid() -> None:
+    """25 страниц на [2, 8, 10, 2] дают [2, 9, 12, 2]: распределение не меняется, план — нет."""
+    payload = plan_payload(
+        section("Введение", 2), section("А", 8), section("Б", 10), section("Заключение", 2)
+    )
+    assert distribute_pages([2, 8, 10, 2], 25) == [2, 9, 12, 2]
+
+    with pytest.raises(InvalidPlanResponse):
+        validate_plan(payload, 25)
+
+
+@pytest.mark.parametrize("count", [3, 4, MAX_SECTIONS])
+def test_target_of_max_pages_per_section_is_accepted(count: int) -> None:
+    target = MAX_SECTION_PAGES * count
+    plan = validate_plan(_sections(count), target)
+
+    pages = [s["target_pages"] for s in plan["sections"]]
+    assert pages == [MAX_SECTION_PAGES] * count
+    assert sum(pages) == plan["total_pages"] == target
+
+
+@pytest.mark.parametrize("count", [3, 4, MAX_SECTIONS])
+def test_target_over_max_pages_per_section_is_invalid(count: int) -> None:
+    """8·n + 1 страниц на n разделов: какой-то раздел больше 8 при любых весах."""
+    with pytest.raises(InvalidPlanResponse):
+        validate_plan(_sections(count), MAX_SECTION_PAGES * count + 1)
+
+
+@pytest.mark.parametrize("target", [3, 4, 10, 24])
+def test_accepted_plans_respect_section_limit_and_sum(target: int) -> None:
+    plan = validate_plan(_sections(3), target)
+
+    pages = [s["target_pages"] for s in plan["sections"]]
+    assert sum(pages) == plan["total_pages"] == target
+    assert all(1 <= p <= MAX_SECTION_PAGES for p in pages)
+    assert oversized_sections(plan) == []
+
+
+def test_oversized_sections_lists_indexes() -> None:
+    plan = {
+        "sections": [
+            {"title": "А", "target_pages": MAX_SECTION_PAGES},
+            {"title": "Б", "target_pages": MAX_SECTION_PAGES + 1},
+            {"title": "В", "target_pages": None},
+            {"title": "Г"},
+            {"title": "Д", "target_pages": 500},
+        ]
+    }
+
+    assert oversized_sections(plan) == [1, 4]

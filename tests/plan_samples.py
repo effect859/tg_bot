@@ -53,15 +53,16 @@ def plan_payload(*sections: dict[str, Any]) -> dict[str, Any]:
     return {
         "sections": list(sections)
         or [
-            section("Введение", 2),
+            # Сумма 25 — объём ТЗ FULL; каждый раздел не больше MAX_SECTION_PAGES (8).
+            section("Введение", 3),
             section(
                 "Характеристика организации",
                 8,
                 requirements=["Описать структуру отдела продаж"],
                 subsections=[subsection("Общие сведения", 3), subsection("Структура", 5)],
             ),
-            section("Анализ бизнес-процессов", 10),
-            section("Заключение", 2),
+            section("Анализ бизнес-процессов", 8),
+            section("Заключение", 6),
         ]
     }
 

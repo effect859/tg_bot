@@ -15,6 +15,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.domain.enums import OrderStatus
+from app.domain.report_generation import MAX_SECTION_PAGES
 from app.domain.requirements import MAX_TARGET_PAGES, AnalysisInput, normalize_whitespace
 from app.domain.schemas import PlanContent
 
@@ -45,7 +46,9 @@ MAX_TITLE_CHARS = 200
 MAX_DESCRIPTION_CHARS = 1000
 MAX_REQUIREMENTS = 10
 MAX_REQUIREMENT_CHARS = 300
-MAX_SECTION_PAGES = MAX_TARGET_PAGES
+# Сырое число страниц от модели: вес при распределении объёма ТЗ или объём раздела
+# без ТЗ. Объём раздела в принятом плане ограничен MAX_SECTION_PAGES генератора.
+MAX_PAGE_WEIGHT = MAX_TARGET_PAGES
 
 
 # --- Вход модели -------------------------------------------------------------------
@@ -141,6 +144,8 @@ def validate_plan(raw: Any, target_pages: int | None) -> dict[str, Any]:
     Страницы: при заданном в ТЗ объёме распределяются детерминированно
     (distribute_pages), иначе сохраняются значения модели. Разделов больше, чем
     страниц в ТЗ, — план не принимается: по странице на раздел в объём не уложить.
+    Раздел больше MAX_SECTION_PAGES страниц (в том числе после распределения) —
+    тоже: генератор пишет раздел одним ответом модели и такой не напишет.
 
     Raises InvalidPlanResponse.
     """
@@ -160,6 +165,8 @@ def validate_plan(raw: Any, target_pages: int | None) -> dict[str, Any]:
         for section, section_pages in zip(sections, pages, strict=True):
             section["target_pages"] = section_pages
             _fit_subsections(section)
+    if oversized_sections({"sections": sections}):
+        raise InvalidPlanResponse("section pages exceed generator limit")
     section_pages = [s["target_pages"] for s in sections]
     total = sum(section_pages) if all(p is not None for p in section_pages) else None
 
@@ -168,6 +175,15 @@ def validate_plan(raw: Any, target_pages: int | None) -> dict[str, Any]:
     except ValidationError as exc:  # не должно случаться после проверок выше
         raise InvalidPlanResponse("plan schema rejected the result") from exc
     return plan.model_dump(mode="json")
+
+
+def oversized_sections(plan: dict[str, Any]) -> list[int]:
+    """Разделы плана (номера с нуля) больше MAX_SECTION_PAGES: их генератор не напишет."""
+    return [
+        index
+        for index, section in enumerate(plan["sections"])
+        if (pages := section.get("target_pages")) is not None and pages > MAX_SECTION_PAGES
+    ]
 
 
 def _section(item: Any) -> dict[str, Any]:
@@ -251,7 +267,7 @@ def _strip_numbering(title: str) -> str:
 def _pages(value: Any) -> int | None:
     if value is None:
         return None
-    if type(value) is not int or not 1 <= value <= MAX_SECTION_PAGES:  # bool — не число
+    if type(value) is not int or not 1 <= value <= MAX_PAGE_WEIGHT:  # bool — не число
         raise InvalidPlanResponse("pages invalid")
     return value
 

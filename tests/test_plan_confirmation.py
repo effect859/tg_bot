@@ -17,8 +17,11 @@ from app.domain.errors import (
     InvalidStatusTransitionError,
     OutdatedVersionError,
     PlanChangedError,
+    PlanNotConfirmedError,
+    PlanSectionTooLargeError,
     VersionNotFoundError,
 )
+from app.domain.plan import MAX_SECTION_PAGES
 from app.domain.requirements_dialog import content_digest
 from app.services import orders
 from app.services import plan_confirmation as service
@@ -145,6 +148,49 @@ async def test_changed_plan_is_not_confirmed(session: AsyncSession) -> None:
     await session.rollback()
 
     await _assert_unchanged(session, order_id, S.WAITING_FOR_PLAN_CONFIRMATION)
+
+
+async def _oversize_draft(session: AsyncSession, order_id: int) -> str:
+    """Черновик с разделом больше предела генератора, записанный в обход validate_plan
+    (план, сохранённый до Stage 3.9); возвращает его отпечаток."""
+    [draft] = await _plans(session, order_id)
+    content = dict(draft.content)
+    content["sections"] = [dict(s) for s in content["sections"]]
+    content["sections"][2]["target_pages"] = MAX_SECTION_PAGES + 1
+    await session.execute(
+        update(OrderPlanVersion).where(OrderPlanVersion.id == draft.id).values(content=content)
+    )
+    await session.commit()
+    return content_digest(content)
+
+
+async def test_draft_with_oversized_section_is_not_confirmed(session: AsyncSession) -> None:
+    order_id = await _planned_order(session)
+    digest = await _oversize_draft(session, order_id)
+
+    with pytest.raises(PlanSectionTooLargeError) as raised:
+        await confirm_plan(session, order_id, digest)
+    await session.rollback()
+
+    assert raised.value.sections == [2]
+    await _assert_unchanged(session, order_id, S.WAITING_FOR_PLAN_CONFIRMATION)
+    order = await _fresh(session, order_id)
+    assert order.price is None  # в PAYMENT_PENDING не входил
+    with pytest.raises(PlanNotConfirmedError):
+        await _require_confirmed_plan(session, order_id)
+
+
+async def test_draft_with_max_section_pages_is_confirmed(session: AsyncSession) -> None:
+    order_id = await _planned_order(session)
+    [draft] = await _plans(session, order_id)
+    # ТЗ FULL: 25 страниц на [3, 8, 8, 6] — разделы на границе предела.
+    assert max(s["target_pages"] for s in draft.content["sections"]) == MAX_SECTION_PAGES
+
+    await confirm_plan(session, order_id, await _digest(session, order_id))
+    await session.commit()
+
+    assert (await _fresh(session, order_id)).status is S.PAYMENT_PENDING
+    assert [p.status for p in await _plans(session, order_id)] == [VersionStatus.CONFIRMED]
 
 
 async def test_empty_digest_is_not_accepted(session: AsyncSession) -> None:

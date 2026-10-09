@@ -41,7 +41,13 @@ from app.bot.reminders import active_order_reminder
 from app.bot.setup import create_dispatcher, notify_plan_outcome
 from app.db.models import LLMCall, Order, OrderPlanVersion, User
 from app.domain.enums import LLMCallStatus, OrderStatus
-from app.domain.plan import MAX_PLAN_LLM_CALLS, PlanOutcome, PlanOutcomeKind, validate_plan
+from app.domain.plan import (
+    MAX_PLAN_LLM_CALLS,
+    MAX_SECTION_PAGES,
+    PlanOutcome,
+    PlanOutcomeKind,
+    validate_plan,
+)
 from app.domain.requirements_dialog import content_digest
 from app.llm.base import LLMPermanentError, LLMTemporaryError
 from app.services import orders
@@ -428,7 +434,7 @@ def _worst_case_plan() -> dict[str, Any]:
                 "title": f"{i}".ljust(200, "&"),
                 "description": "<" * 1000,
                 "requirements": [f"{j}" + ">" * 299 for j in range(10)],
-                "target_pages": 500,
+                "target_pages": MAX_SECTION_PAGES,
                 "subsections": [
                     {"title": f"{j}" + "&" * 199, "description": "&" * 1000, "target_pages": 1}
                     for j in range(10)

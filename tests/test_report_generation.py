@@ -17,13 +17,15 @@ import pytest
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.db.models import LLMCall, Order, OrderReportSection
-from app.domain.enums import LLMCallStatus, OrderStatus
+from app.db.models import LLMCall, Order, OrderPlanVersion, OrderReportSection
+from app.domain.enums import LLMCallStatus, OrderStatus, VersionStatus
 from app.domain.errors import VersionNotFoundError
-from app.domain.report_generation import SECTION_JSON_SCHEMA, ReportOutcomeKind
+from app.domain.report_generation import MAX_SECTION_PAGES, SECTION_JSON_SCHEMA, ReportOutcomeKind
 from app.llm.anthropic import AnthropicLLMClient
 from app.llm.base import LLMPermanentError, LLMTemporaryError, StopReason
+from app.services import orders
 from app.services import report_generation as service
+from app.services.plan_generation import generate_plan
 from app.services.report_generation import (
     NOT_COMPLETED,
     ReportGenerationRecovery,
@@ -32,8 +34,9 @@ from app.services.report_generation import (
     generate_next_section,
     run_generation_pass,
 )
+from billing_samples import pay_for_order
 from fake_llm import FakeLLMClient, result
-from plan_samples import PERSONAL_VALUES, plan_result, section
+from plan_samples import PERSONAL_VALUES, REQUIREMENTS, plan_result, preparing_order, section
 from report_samples import (
     ALL_GOOD,
     REPORT_PLAN,
@@ -187,8 +190,37 @@ async def test_section_of_max_pages_is_generated(session: AsyncSession) -> None:
     assert len(llm.calls) == 1
 
 
+async def _legacy_generating_order(session: AsyncSession, pages: int) -> int:
+    """Заказ в GENERATING с подтверждённым планом, первый раздел которого ``pages``
+    страниц (план, подтверждённый до Stage 3.9). Черновик правится до подтверждения
+    (триггер защищает только подтверждённые версии) и подтверждается шагами
+    confirm_plan без проверки D1."""
+    order_id = await preparing_order(session, content={**REQUIREMENTS, "target_pages": None})
+    generated = await generate_plan(session, FakeLLMClient(_plan_pages(8)), order_id)
+    assert generated.plan is not None, generated
+    [draft] = await orders.get_plan_versions(session, order_id)
+    assert draft.status is VersionStatus.DRAFT
+    content = dict(draft.content)
+    content["sections"] = [dict(s) for s in content["sections"]]
+    content["sections"][0]["target_pages"] = pages
+    content["total_pages"] = sum(s["target_pages"] for s in content["sections"])
+    await session.execute(
+        update(OrderPlanVersion).where(OrderPlanVersion.id == draft.id).values(content=content)
+    )
+    await orders.lock_order(session, order_id)
+    await orders.confirm_plan_version(session, order_id, draft.id)
+    await orders.change_status(session, order_id, S.PAYMENT_PENDING)
+    await session.commit()
+    await pay_for_order(session, order_id)
+    return order_id
+
+
 async def test_section_over_max_pages_fails_without_llm_call(session: AsyncSession) -> None:
-    order_id = await generating_order(session, target_pages=None, plan=_plan_pages(9))
+    """Последняя защита генератора: новый план с таким разделом до оплаты не доходит."""
+    order_id = await _legacy_generating_order(session, MAX_SECTION_PAGES + 1)
+    [plan] = await orders.get_plan_versions(session, order_id)
+    assert plan.status is VersionStatus.CONFIRMED
+    assert plan.content["sections"][0]["target_pages"] == MAX_SECTION_PAGES + 1
     llm = FakeLLMClient(answer(1, chars=9 * 1800))
 
     outcome = await generate_next_section(session, llm, order_id)

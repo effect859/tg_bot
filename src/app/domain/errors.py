@@ -193,6 +193,15 @@ class PlanChangedError(OrderDomainError):
         self.order_id = order_id
 
 
+class PlanSectionTooLargeError(OrderDomainError):
+    """В плане раздел больше, чем генератор пишет одним ответом: план не подтверждается."""
+
+    def __init__(self, order_id: int, sections: list[int]) -> None:
+        super().__init__(f"Order {order_id}: plan sections {sections} exceed generator limit")
+        self.order_id = order_id
+        self.sections = sections
+
+
 class MaterialNotFoundError(OrderDomainError):
     def __init__(self, material_id: int) -> None:
         super().__init__(f"Material {material_id} not found")

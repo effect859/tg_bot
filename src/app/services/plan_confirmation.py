@@ -13,7 +13,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import OrderPlanVersion
 from app.domain.enums import OrderStatus, VersionStatus
-from app.domain.errors import InvalidStatusTransitionError, PlanChangedError, VersionNotFoundError
+from app.domain.errors import (
+    InvalidStatusTransitionError,
+    PlanChangedError,
+    PlanSectionTooLargeError,
+    VersionNotFoundError,
+)
+from app.domain.plan import oversized_sections
 from app.domain.requirements_dialog import content_digest
 from app.services.orders import change_status, confirm_plan_version, get_plan_versions, lock_order
 
@@ -28,7 +34,8 @@ async def confirm_plan(session: AsyncSession, order_id: int, digest: str) -> Ord
 
     Raises InvalidStatusTransitionError (заказ не ждёт подтверждения плана),
     VersionNotFoundError (нет черновика плана), PlanChangedError, OutdatedVersionError
-    (план построен не на действующем ТЗ).
+    (план построен не на действующем ТЗ), PlanSectionTooLargeError (раздел больше,
+    чем пишет генератор: такой план не должен дойти до оплаты).
     """
     order = await lock_order(session, order_id)
     if order.status is not S.WAITING_FOR_PLAN_CONFIRMATION:
@@ -36,6 +43,11 @@ async def confirm_plan(session: AsyncSession, order_id: int, digest: str) -> Ord
     draft = await _draft(session, order_id)
     if content_digest(draft.content) != digest:
         raise PlanChangedError(order_id)
+    # Новый план это уже прошёл (validate_plan); защита от черновиков, сохранённых в
+    # обход проверки или до неё.
+    oversized = oversized_sections(draft.content)
+    if oversized:
+        raise PlanSectionTooLargeError(order_id, oversized)
     version = await confirm_plan_version(session, order_id, draft.id)
     await change_status(session, order_id, S.PAYMENT_PENDING)
     return version
