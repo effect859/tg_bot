@@ -169,6 +169,14 @@ class PlanLimitReachedError(OrderDomainError):
         self.limit = limit
 
 
+class PlanTargetPagesUnsupportedError(OrderDomainError):
+    """Объём подтверждённого ТЗ вне поддерживаемого диапазона: повтор плана бесполезен."""
+
+    def __init__(self, order_id: int) -> None:
+        super().__init__(f"Order {order_id}: requirements target pages are not supported")
+        self.order_id = order_id
+
+
 class RequirementFieldNotEditableError(OrderDomainError):
     """Поле ТЗ нельзя изменить из диалога: редактируются только обязательные поля."""
 
@@ -182,6 +190,15 @@ class RequirementsChangedError(OrderDomainError):
 
     def __init__(self, order_id: int) -> None:
         super().__init__(f"Order {order_id}: requirements changed since they were shown")
+        self.order_id = order_id
+
+
+class RequirementsVolumeConsentError(OrderDomainError):
+    """Кнопка не соответствует объёму ТЗ: согласие на работу без объёма нужно именно
+    при неподдерживаемом объёме и только при нём."""
+
+    def __init__(self, order_id: int) -> None:
+        super().__init__(f"Order {order_id}: volume consent does not match requirements")
         self.order_id = order_id
 
 

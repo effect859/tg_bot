@@ -57,7 +57,14 @@ from app.services.storage.local import LocalFileStorage
 from app.services.users import register_or_update_user
 from dialog_samples import FULL, fresh_order, order_with_draft
 from fake_llm import FakeLLMClient
-from plan_samples import GOOD_PLAN, PERSONAL_VALUES, plan_payload, preparing_order, section
+from plan_samples import (
+    GOOD_PLAN,
+    PERSONAL_VALUES,
+    REQUIREMENTS,
+    plan_payload,
+    preparing_order,
+    section,
+)
 
 S = OrderStatus
 K = PlanOutcomeKind
@@ -673,3 +680,62 @@ async def test_retry_plan_callback_reaches_plan_handler(
     [answer] = [r for r in recorded.requests if isinstance(r, AnswerCallbackQuery)]
     # Диспетчер без LLM-клиента: хендлер плана отвечает, что составление недоступно.
     assert (answer.text, answer.show_alert) == (texts.PLAN_UNAVAILABLE, True)
+
+
+# --- Объём ТЗ вне 3..120 (Stage 3.10) -------------------------------------------------
+
+
+async def _unsupported_target_order(session: AsyncSession, *, failed: bool = True) -> int:
+    """ТЗ подтверждено до проверки объёма: target_pages = 150."""
+    order_id = await preparing_order(session, content={**REQUIREMENTS, "target_pages": 150})
+    if failed:
+        outcome = await generate_plan(session, FakeLLMClient(GOOD_PLAN), order_id)
+        assert outcome.error_code == service.TARGET_PAGES_UNSUPPORTED
+    return order_id
+
+
+def test_unsupported_target_reply_has_no_retry_button() -> None:
+    outcome = PlanOutcome(K.FAILED, 7, can_retry=False, error_code=service.TARGET_PAGES_UNSUPPORTED)
+
+    reply = plan_reply(outcome)
+
+    assert reply is not None
+    text, markup = reply
+    assert text == texts.plan_target_pages_unsupported(7)
+    assert "от 3 до 120 стр." in text
+    assert _actions(markup) == ["cancel"]
+
+
+async def test_run_plan_with_unsupported_target_explains_without_llm_call(
+    session: AsyncSession,
+) -> None:
+    order_id = await _unsupported_target_order(session, failed=False)
+    bot, llm = AsyncMock(), FakeLLMClient(GOOD_PLAN)
+
+    await plan.run_plan(_callback(), bot, session, llm, order_id)
+
+    assert _sent(bot) == [texts.PLAN_STARTED, texts.plan_target_pages_unsupported(order_id)]
+    assert _actions(_last_markup(bot)) == ["cancel"]
+    assert llm.calls == []
+
+
+async def test_retry_of_unsupported_target_is_refused(session: AsyncSession) -> None:
+    user = await _user(session)
+    order_id = await _unsupported_target_order(session)
+    bot, llm = AsyncMock(), FakeLLMClient(GOOD_PLAN)
+
+    callback = await _retry(session, user, order_id, bot, llm)
+
+    assert _alert(callback) == texts.PLAN_TARGET_PAGES_UNSUPPORTED
+    assert _sent(bot) == [] and llm.calls == []
+    order = await fresh_order(session, order_id)
+    assert (order.status, order.failed_from_status) == (S.FAILED, S.PREPARING_PLAN)
+
+
+async def test_reminder_for_unsupported_target_has_no_retry(session: AsyncSession) -> None:
+    order_id = await _unsupported_target_order(session)
+
+    text, markup = await active_order_reminder(session, await fresh_order(session, order_id))
+
+    assert text == texts.plan_target_pages_unsupported(order_id)
+    assert _actions(markup) == ["cancel"]

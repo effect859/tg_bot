@@ -19,7 +19,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.bot import texts
 from app.db.models import LLMCall, Order, OrderPlanVersion, OrderRequirementsVersion
 from app.domain.enums import LLMCallStatus, OrderStatus, VersionStatus
-from app.domain.errors import InvalidStatusTransitionError, PlanLimitReachedError
+from app.domain.errors import (
+    InvalidStatusTransitionError,
+    PlanLimitReachedError,
+    PlanTargetPagesUnsupportedError,
+)
 from app.domain.plan import (
     MAX_PLAN_LLM_CALLS,
     MAX_SECTION_PAGES,
@@ -347,8 +351,11 @@ async def test_three_failed_attempts_lead_to_failed(session: AsyncSession) -> No
 async def test_more_sections_than_target_pages_is_retried_as_invalid_response(
     session: AsyncSession,
 ) -> None:
-    """Объём ТЗ 2 страницы, у модели 4 раздела: не сохраняется, повтор как invalid_response."""
-    order_id = await preparing_order(session, content={**REQUIREMENTS, "target_pages": 2})
+    """Объём ТЗ 3 страницы, у модели 4 раздела: не сохраняется, повтор как invalid_response.
+
+    (Объём меньше MIN_REPORT_PAGES до модели не доходит — test_unsupported_target_*.)
+    """
+    order_id = await preparing_order(session, content={**REQUIREMENTS, "target_pages": 3})
     llm = FakeLLMClient(GOOD_PLAN)
 
     outcomes = [await generate_plan(session, llm, order_id) for _ in range(3)]
@@ -848,3 +855,95 @@ def test_recovery_constants() -> None:
     assert timedelta(minutes=1) == service.NEW_ORDER_GRACE
     assert service.MAX_TOKENS == 16_000
     assert service.LLM_STEP == "plan_generation"
+
+
+# --- Объём ТЗ вне 3..120 (Stage 3.10) -------------------------------------------------
+# ТЗ, подтверждённое до проверки объёма: план не составить, и повтор не поможет —
+# вызов модели не тратится, попытка не учитывается, кнопки повтора нет.
+
+
+@pytest.mark.parametrize("pages", [1, 2, 121, 500, 501])
+async def test_unsupported_target_fails_without_llm_call(session: AsyncSession, pages: int) -> None:
+    order_id = await preparing_order(session, content={**REQUIREMENTS, "target_pages": pages})
+    llm = FakeLLMClient(GOOD_PLAN)
+
+    outcome = await generate_plan(session, llm, order_id)
+
+    assert (outcome.kind, outcome.error_code) == (K.FAILED, service.TARGET_PAGES_UNSUPPORTED)
+    assert outcome.can_retry is False
+    assert llm.calls == [] and await _calls(session, order_id) == []
+    order = await _fresh(session, order_id)
+    assert (order.status, order.failed_from_status) == (S.FAILED, S.PREPARING_PLAN)
+    assert order.error == "plan_generation: target_pages_unsupported"
+    assert order.step_attempts == 0
+    assert await _plans(session, order_id) == []
+
+
+async def test_unsupported_target_after_interrupted_attempt_fails_without_call(
+    session: AsyncSession,
+) -> None:
+    """Зависшая попытка (до деплоя проверки) тоже не порождает нового вызова."""
+    order_id = await preparing_order(session, content={**REQUIREMENTS, "target_pages": 150})
+    stale = datetime.now(UTC) - service.STEP_STALE_AFTER - timedelta(minutes=1)
+    await _set(session, order_id, step_attempts=1, step_started_at=stale)
+    llm = FakeLLMClient(GOOD_PLAN)
+
+    outcome = await generate_plan(session, llm, order_id)
+
+    assert (outcome.kind, outcome.error_code) == (K.FAILED, service.TARGET_PAGES_UNSUPPORTED)
+    assert llm.calls == []
+    order = await _fresh(session, order_id)
+    assert (order.status, order.step_attempts, order.step_started_at) == (S.FAILED, 1, None)
+
+
+async def test_unsupported_target_cannot_be_restarted(session: AsyncSession) -> None:
+    order_id = await preparing_order(session, content={**REQUIREMENTS, "target_pages": 121})
+    await generate_plan(session, FakeLLMClient(GOOD_PLAN), order_id)
+
+    with pytest.raises(PlanTargetPagesUnsupportedError):
+        await restart_plan_generation(session, order_id)
+    await session.rollback()
+
+    order = await _fresh(session, order_id)
+    assert (order.status, order.failed_from_status) == (S.FAILED, S.PREPARING_PLAN)
+    assert (await generate_plan(session, FakeLLMClient(GOOD_PLAN), order_id)).kind is K.SKIPPED
+
+
+async def test_plan_after_consent_has_no_volume_and_hides_it_from_model(
+    session: AsyncSession,
+) -> None:
+    content = {**REQUIREMENTS, "target_pages": None, "unsupported_target_pages": 4321}
+    order_id = await preparing_order(session, content=content)
+    llm = FakeLLMClient(GOOD_PLAN)
+
+    outcome = await generate_plan(session, llm, order_id)
+
+    assert outcome.kind is K.COMPLETED
+    [call] = llm.calls
+    assert "unsupported_target_pages" not in call["prompt"]
+    assert "4321" not in call["prompt"] and "4321" not in call["system"]
+    assert '"target_pages"' not in call["prompt"]  # объёма в ТЗ для модели нет
+    [plan] = await _plans(session, order_id)
+    assert [s["target_pages"] for s in plan.content["sections"]] == [3, 8, 8, 6]
+
+
+@pytest.mark.parametrize(
+    ("pages", "plan"),
+    [
+        (3, plan_result(section("А", 1), section("Б", 1), section("В", 1))),
+        (25, GOOD_PLAN),
+        (120, plan_result(*(section(f"Раздел {i}", 8) for i in range(15)))),
+    ],
+)
+async def test_supported_target_bounds_still_plan(
+    session: AsyncSession, pages: int, plan: object
+) -> None:
+    order_id = await preparing_order(session, content={**REQUIREMENTS, "target_pages": pages})
+    llm = FakeLLMClient(plan)
+
+    outcome = await generate_plan(session, llm, order_id)
+
+    assert outcome.kind is K.COMPLETED
+    assert len(llm.calls) == 1
+    [saved] = await _plans(session, order_id)
+    assert saved.content["total_pages"] == pages

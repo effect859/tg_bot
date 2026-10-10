@@ -71,7 +71,6 @@ MIN_EVIDENCE_CHARS = 10
 MAX_EVIDENCE_CHARS = 500
 MAX_EXTRA_REQUIREMENTS = 20
 MAX_EXTRA_REQUIREMENT_CHARS = 500
-MAX_TARGET_PAGES = 500
 MIN_PRACTICE_DATE = date(2000, 1, 1)
 MAX_PRACTICE_DATE = date(2100, 12, 31)
 
@@ -357,6 +356,12 @@ def _date(value: Any) -> date | None:
 
 
 def _pages(value: Any) -> int | None:
+    """Объём из материалов: любое целое от 1 (bool — не число).
+
+    Верхней границы нет: требование, которое план не выполнит, не отбрасывается, а
+    показывается пользователю (plan.split_volume). Длину числа ограничивает цитата
+    (не больше MAX_EVIDENCE_CHARS): то же число должно в ней стоять.
+    """
     if type(value) is not int:
         return None
-    return value if 1 <= value <= MAX_TARGET_PAGES else None
+    return value if value >= 1 else None

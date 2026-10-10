@@ -23,6 +23,7 @@ from app.domain.materials import (
     MAX_MATERIALS_PER_ORDER,
     MaterialCompletionState,
 )
+from app.domain.plan import MAX_REPORT_PAGES, MIN_REPORT_PAGES, unsupported_volume
 from app.domain.requirements import MAX_ANALYSIS_INPUT_CHARS, REQUIRED_FIELDS
 from app.domain.requirements_dialog import TEXT_ANSWER_LIMITS, AnswerError
 from app.extraction.base import WarningCode
@@ -200,6 +201,7 @@ ANALYSIS_UNAVAILABLE = "Анализ материалов сейчас недо�
 # --- Уточнение и подтверждение ТЗ ---------------------------------------------------
 
 BTN_CONFIRM_REQUIREMENTS = "✅ Подтвердить ТЗ"
+BTN_CONFIRM_WITHOUT_VOLUME = "✅ Продолжить без объёма"
 BTN_EDIT_REQUIREMENTS = "✏️ Изменить"
 # Даты меняются вместе: одна кнопка на обе.
 BTN_EDIT_DATES = "Даты практики"
@@ -235,6 +237,10 @@ REQUIREMENTS_CHANGED = "ТЗ изменилось после этого сооб
 REQUIREMENTS_ALREADY_CONFIRMED = "ТЗ уже подтверждено."
 REQUIREMENTS_CONFIRMED = "ТЗ подтверждено. Следующий шаг — подготовка плана отчёта."
 REQUIREMENTS_CONFIRM_PROMPT = "Проверьте данные. Если всё верно — подтвердите ТЗ."
+REQUIREMENTS_VOLUME_PROMPT = (
+    "Проверьте данные. Если всё верно и отчёт без указанного объёма вам подходит — "
+    "нажмите «Продолжить без объёма». Если нет — отмените заказ."
+)
 
 # Лимит Telegram на длину сообщения. Резюме ТЗ укладывается в него при любых данных.
 MAX_MESSAGE_CHARS = 4096
@@ -260,6 +266,12 @@ PLAN_LIMIT_REACHED = (
     "Лимит попыток составления плана исчерпан. Отмените заказ, чтобы оформить новый."
 )
 PLAN_UNAVAILABLE = "Составление плана сейчас недоступно. Попробуйте позже."
+PLAN_TARGET_PAGES_REASON = (
+    f"объём отчёта в ТЗ не поддерживается (от {MIN_REPORT_PAGES} до {MAX_REPORT_PAGES} стр.)."
+)
+PLAN_TARGET_PAGES_UNSUPPORTED = (
+    f"Повтор не поможет: {PLAN_TARGET_PAGES_REASON} Отмените заказ, чтобы оформить новый."
+)
 PLAN_SHOW_FAILED = "Не удалось показать план из-за технической ошибки. Попробуйте позже."
 PLAN_ACTION_FAILED = "Не удалось выполнить действие из-за технической ошибки. Попробуйте ещё раз."
 PLAN_NEXT_STEP = (
@@ -571,6 +583,14 @@ def plan_failed(order_id: int, *, can_retry: bool) -> str:
     return f"{text} {PLAN_LIMIT_REACHED}"
 
 
+def plan_target_pages_unsupported(order_id: int) -> str:
+    """План не составляется: объём подтверждённого ТЗ вне диапазона — повтор не поможет."""
+    return (
+        f"❌ Не удалось составить план отчёта по заказу #{order_id}: {PLAN_TARGET_PAGES_REASON} "
+        "Отмените заказ, чтобы оформить новый."
+    )
+
+
 def plan_already_restarted(order: Order) -> str:
     return f"План отчёта по заказу #{order.id} уже составляется."
 
@@ -658,7 +678,15 @@ def _render_summary(
     for name in REQUIRED_FIELDS:
         shown = _field_value(name, content.get(name), value_limit)
         lines.append(f"<b>{field_label(name)}:</b> {shown}")
-    optional = [name for name in SUMMARY_OPTIONAL_FIELDS if content.get(name) not in (None, "")]
+    volume = unsupported_volume(content)
+    optional = [
+        name
+        for name in SUMMARY_OPTIONAL_FIELDS
+        if content.get(name) not in (None, "")
+        # Неподдерживаемый объём (в черновике до unsupported_target_pages он в
+        # target_pages) показывается один раз — в предупреждении ниже.
+        and not (name == "target_pages" and volume is not None)
+    ]
     raw_extra = content.get("extra_requirements")
     extra = (
         [item for item in raw_extra if isinstance(item, str)] if isinstance(raw_extra, list) else []
@@ -673,8 +701,20 @@ def _render_summary(
             lines += [f"• {_preview(item, value_limit)}" for item in extra[:max_items]]
             if len(extra) > max_items:
                 lines.append(f"…и ещё {len(extra) - max_items}")
-    lines += ["", REQUIREMENTS_CONFIRM_PROMPT]
+    if volume is None:
+        lines += ["", REQUIREMENTS_CONFIRM_PROMPT]
+    else:
+        lines += ["", volume_unsupported_warning(volume), "", REQUIREMENTS_VOLUME_PROMPT]
     return "\n".join(lines)
+
+
+def volume_unsupported_warning(pages: int) -> str:
+    """Объём из материалов не поддерживается. Число — целиком: обрезанное число неверно."""
+    return (
+        f"⚠️ В материалах указан объём отчёта {pages} стр. Поддерживается объём от "
+        f"{MIN_REPORT_PAGES} до {MAX_REPORT_PAGES} стр. Если продолжить, отчёт будет "
+        "подготовлен по содержанию, без соблюдения указанного объёма."
+    )
 
 
 def _field_value(field: str, value: object, limit: int) -> str:

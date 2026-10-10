@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -18,6 +20,7 @@ from app.domain.errors import (
     VersionAlreadyConfirmedError,
 )
 from app.domain.order_flow import is_active
+from app.domain.requirements_dialog import content_digest
 from app.domain.schemas import PlanContent, PlanSection
 from app.services import orders as svc
 from app.services.users import register_or_update_user
@@ -284,6 +287,69 @@ async def test_requirements_content_is_validated(session: AsyncSession) -> None:
         await svc.create_requirements_version(
             session, order.id, {"practice_start": "2026-07-01", "practice_end": "2026-06-01"}
         )
+
+
+# Stage 3.10: неподдерживаемый объём — отдельное поле, строго целое, не вместе с
+# target_pages; версии, сохранённые до него, читаются и подтверждаются как раньше.
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        {"target_pages": 25, "unsupported_target_pages": 150},
+        {"unsupported_target_pages": 0},
+        {"unsupported_target_pages": -1},
+        {"unsupported_target_pages": True},
+        {"unsupported_target_pages": "150"},
+        {"unsupported_target_pages": 150.0},
+    ],
+)
+async def test_unsupported_volume_content_is_validated(
+    session: AsyncSession, content: dict[str, object]
+) -> None:
+    order = await _order(session)
+
+    with pytest.raises(ValueError):
+        await svc.create_requirements_version(session, order.id, content)
+
+
+async def test_huge_unsupported_volume_survives_jsonb(session: AsyncSession) -> None:
+    pages = 10**499 + 7  # 500 цифр: самое длинное число, которое пройдёт цитату
+    order_id = (await _order(session)).id
+    draft = await svc.create_requirements_version(
+        session, order_id, {**REQUIREMENTS, "target_pages": None, "unsupported_target_pages": pages}
+    )
+    digest = content_digest(draft.content)
+    await session.commit()
+    session.expire_all()
+
+    [stored] = await svc.get_requirements_versions(session, order_id)
+
+    assert stored.content["unsupported_target_pages"] == pages
+    assert type(stored.content["unsupported_target_pages"]) is int
+    assert content_digest(stored.content) == digest
+
+
+async def test_requirements_saved_before_volume_field_keep_digest(session: AsyncSession) -> None:
+    """Версия без ключа unsupported_target_pages: чтение не меняет её и её отпечаток."""
+    order_id = (await _order(session)).id
+    draft = await svc.create_requirements_version(session, order_id, REQUIREMENTS)
+    legacy = {k: v for k, v in draft.content.items() if k != "unsupported_target_pages"}
+    await session.execute(
+        text(
+            "UPDATE order_requirements_versions SET content = CAST(:content AS jsonb) "
+            "WHERE id = :id"
+        ),
+        {"content": json.dumps(legacy), "id": draft.id},
+    )
+    await session.commit()
+    session.expire_all()
+
+    for _ in range(2):
+        [stored] = await svc.get_requirements_versions(session, order_id)
+        assert stored.content == legacy
+        assert content_digest(stored.content) == content_digest(legacy)
+        session.expire_all()
 
 
 @pytest.mark.parametrize("table", ["order_requirements_versions", "order_plan_versions"])

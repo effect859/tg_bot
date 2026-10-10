@@ -12,8 +12,11 @@ from app.domain.plan import (
     MAX_PAGE_WEIGHT,
     MAX_PLAN_ATTEMPTS,
     MAX_PLAN_LLM_CALLS,
+    MAX_REPORT_PAGES,
     MAX_SECTION_PAGES,
     MAX_SECTIONS,
+    MIN_REPORT_PAGES,
+    MIN_SECTIONS,
     NOT_FOR_PLAN,
     PLAN_JSON_SCHEMA,
     PLAN_REQUIREMENT_FIELDS,
@@ -21,6 +24,9 @@ from app.domain.plan import (
     distribute_pages,
     oversized_sections,
     plan_requirements,
+    report_pages_supported,
+    split_volume,
+    unsupported_volume,
     validate_plan,
 )
 from app.domain.schemas import PlanContent
@@ -634,3 +640,77 @@ def test_oversized_sections_lists_indexes() -> None:
     }
 
     assert oversized_sections(plan) == [1, 4]
+
+
+# --- Объём отчёта из ТЗ (Stage 3.10) -------------------------------------------------
+# План составляется только под объём MIN_REPORT_PAGES..MAX_REPORT_PAGES: не меньше
+# страницы на раздел, не больше MAX_SECTION_PAGES на каждый из MAX_SECTIONS разделов.
+
+HUGE = 10**499 + 7  # 500 цифр — длиннее не бывает: число должно стоять в цитате
+
+
+def test_report_page_limits_are_derived() -> None:
+    assert MIN_REPORT_PAGES == MIN_SECTIONS == 3
+    assert MAX_REPORT_PAGES == MAX_SECTIONS * MAX_SECTION_PAGES == 120
+
+
+@pytest.mark.parametrize(
+    ("pages", "supported"),
+    [
+        (-1, False),
+        (0, False),
+        (1, False),
+        (2, False),
+        (3, True),
+        (8, True),
+        (9, True),
+        (25, True),
+        (120, True),
+        (121, False),
+        (500, False),
+        (501, False),
+        (HUGE, False),
+    ],
+)
+def test_report_pages_supported(pages: int, supported: bool) -> None:
+    assert report_pages_supported(pages) is supported
+
+
+@pytest.mark.parametrize("pages", [3, 25, 120])
+def test_supported_target_stays_in_target_pages(pages: int) -> None:
+    content = {**REQUIREMENTS, "target_pages": pages, "unsupported_target_pages": None}
+
+    assert split_volume(content) == content
+    assert unsupported_volume(content) is None
+
+
+@pytest.mark.parametrize("pages", [1, 2, 121, 500, 501, HUGE])
+def test_unsupported_target_moves_to_its_own_field(pages: int) -> None:
+    content = {**REQUIREMENTS, "target_pages": pages, "unsupported_target_pages": None}
+
+    split = split_volume(content)
+
+    assert split == {**content, "target_pages": None, "unsupported_target_pages": pages}
+    assert content["target_pages"] == pages  # исходный словарь не изменён
+    assert unsupported_volume(split) == pages
+    assert unsupported_volume(content) == pages  # черновик до unsupported_target_pages
+
+
+def test_missing_target_is_neither_supported_nor_unsupported() -> None:
+    content = {**REQUIREMENTS, "target_pages": None, "unsupported_target_pages": None}
+    legacy = {k: v for k, v in content.items() if k != "unsupported_target_pages"}
+
+    assert split_volume(content) == content
+    assert split_volume(legacy) == legacy  # старое содержимое без нового ключа
+    assert unsupported_volume(content) is None
+    assert unsupported_volume(legacy) is None
+
+
+def test_unsupported_volume_is_not_sent_to_model() -> None:
+    content = {**REQUIREMENTS, "target_pages": None, "unsupported_target_pages": 150}
+
+    sent = plan_requirements(content)
+
+    assert "unsupported_target_pages" not in sent
+    assert "target_pages" not in sent
+    assert "150" not in repr(sent)

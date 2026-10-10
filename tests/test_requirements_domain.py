@@ -340,9 +340,10 @@ def test_null_value_is_just_not_found() -> None:
         ("practice_start", "1999-07-01"),
         ("practice_start", "2026-07-01T00:00:00"),
         ("target_pages", 0),
-        ("target_pages", 501),
+        ("target_pages", -25),
         ("target_pages", True),
         ("target_pages", "25"),
+        ("target_pages", 25.0),
         ("topic", "x" * 501),
         ("practice_place", "   "),
         ("practice_type", 7),
@@ -414,3 +415,31 @@ def test_wrong_structure_is_invalid_response(raw: Any) -> None:
 
 def test_normalize_whitespace() -> None:
     assert normalize_whitespace(" a\n\tb\f\xa0 c  ") == "a b c"
+
+
+# --- Объём без верхней границы (Stage 3.10) -----------------------------------------
+# Объём, под который план не составить, не отбрасывается: его увидит пользователь.
+# Длину числа ограничивает только цитата (MAX_EVIDENCE_CHARS): число должно в ней быть.
+
+
+@pytest.mark.parametrize("pages", [1, 2, 121, 500, 501, 10**6, 10**499 + 7])
+def test_any_positive_page_count_with_evidence_is_accepted(pages: int) -> None:
+    # 500-значное число занимает всю цитату целиком.
+    quote = str(pages) if len(str(pages)) == 500 else f"Объём отчёта — {pages} страниц"
+    source = f"{SOURCE}\n{quote}."
+    raw = json.loads(response_json(target_pages=(pages, quote)))
+
+    result = validate_extraction(raw, source)
+
+    assert result.content["target_pages"] == pages
+    assert result.rejected == {}
+
+
+def test_page_count_longer_than_evidence_limit_cannot_be_quoted() -> None:
+    pages = 10**500  # 501 цифра: в цитату до 500 символов не помещается
+    raw = json.loads(response_json(target_pages=(pages, str(pages))))
+
+    result = validate_extraction(raw, f"{SOURCE}\n{pages}")
+
+    assert result.content["target_pages"] is None
+    assert result.rejected == {"target_pages": "evidence_not_found"}

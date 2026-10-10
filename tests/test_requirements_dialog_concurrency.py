@@ -202,3 +202,51 @@ async def test_answer_and_double_submit_of_last_answer(
     status, [(_, stored)] = await _state(committed, order_id)
     assert status is S.WAITING_FOR_DATA_CONFIRMATION
     assert stored == {**FULL, "student_name": "Иванов Иван"}
+
+
+# --- Согласие без объёма (Stage 3.10) ------------------------------------------------
+
+UNSUPPORTED = {**FULL, "target_pages": None, "unsupported_target_pages": 150}
+LEGACY = {**FULL, "target_pages": 150}  # объём в target_pages, как до Stage 3.10
+
+
+@pytest.mark.parametrize(("content", "n"), [(UNSUPPORTED, 6), (LEGACY, 7)])
+async def test_double_consent_confirms_once(
+    committed: Sessionmaker, content: dict[str, Any], n: int
+) -> None:
+    order_id = await _setup(committed, content, S.WAITING_FOR_DATA_CONFIRMATION, n)
+    digest = content_digest(content)
+
+    results = await _race(
+        committed,
+        order_id,
+        lambda s: confirm_requirements(s, order_id, digest, without_volume=True),
+        lambda s: confirm_requirements(s, order_id, digest, without_volume=True),
+    )
+
+    errors = [r for r in results if isinstance(r, Exception)]
+    assert len(errors) == 1 and isinstance(errors[0], InvalidStatusTransitionError)
+    status, found = await _state(committed, order_id)
+    assert status is S.PREPARING_PLAN
+    assert found == [(VersionStatus.CONFIRMED, UNSUPPORTED)]
+
+
+async def test_consent_and_cancel(committed: Sessionmaker) -> None:
+    order_id = await _setup(committed, LEGACY, S.WAITING_FOR_DATA_CONFIRMATION, 8)
+    digest = content_digest(LEGACY)
+
+    consent, cancel = await _race(
+        committed,
+        order_id,
+        lambda s: confirm_requirements(s, order_id, digest, without_volume=True),
+        lambda s: orders.change_status(s, order_id, S.CANCELLED),
+    )
+
+    assert not isinstance(cancel, Exception)
+    status, [(version_status, content)] = await _state(committed, order_id)
+    assert status is S.CANCELLED
+    if isinstance(consent, Exception):  # отмена первой: черновик не тронут
+        assert isinstance(consent, InvalidStatusTransitionError)
+        assert (version_status, content) == (VersionStatus.DRAFT, LEGACY)
+    else:  # согласие успело: ТЗ подтверждено с перенесённым объёмом, затем отмена
+        assert (version_status, content) == (VersionStatus.CONFIRMED, UNSUPPORTED)

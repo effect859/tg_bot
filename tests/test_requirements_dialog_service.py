@@ -1,19 +1,26 @@
 """Уточнение и подтверждение ТЗ на настоящей БД: один черновик v1, переходы, отказы."""
 
+from typing import Any
+
 import pytest
+from sqlalchemy import update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.models import OrderRequirementsVersion
 from app.domain.enums import OrderStatus, VersionStatus
 from app.domain.errors import (
     InvalidStatusTransitionError,
     MaterialsNotAcceptedError,
     RequirementFieldNotEditableError,
     RequirementsChangedError,
+    RequirementsVolumeConsentError,
     VersionAlreadyConfirmedError,
     VersionNotFoundError,
 )
 from app.domain.requirements_dialog import AnswerError, content_digest
 from app.services import orders
+from app.services import requirements_dialog as dialog_service
 from app.services.order_materials import ensure_can_add_material
 from app.services.requirements_dialog import (
     AnswerOutcomeKind,
@@ -269,3 +276,128 @@ async def test_edit_outside_confirmation_is_refused(session: AsyncSession) -> No
 
     [draft] = await versions(session, order_id)
     assert draft.content == AFTER_ANALYSIS
+
+
+# --- Неподдерживаемый объём: согласие продолжить без него (Stage 3.10) ---------------
+
+UNSUPPORTED = {**FULL, "target_pages": None, "unsupported_target_pages": 150}
+# Черновик, сохранённый до поля unsupported_target_pages: объём в target_pages.
+LEGACY = {**FULL, "target_pages": 150}
+LEGACY_WITHOUT_KEY = {k: v for k, v in LEGACY.items() if k != "unsupported_target_pages"}
+
+
+async def _legacy_order(session: AsyncSession, content: dict[str, Any]) -> int:
+    """Заказ на подтверждении ТЗ с черновиком ровно в виде ``content`` (как до Stage 3.10)."""
+    order_id = await order_with_draft(session, FULL, status=S.WAITING_FOR_DATA_CONFIRMATION)
+    [draft] = await versions(session, order_id)
+    await session.execute(
+        update(OrderRequirementsVersion)
+        .where(OrderRequirementsVersion.id == draft.id)
+        .values(content=content)
+    )
+    await session.commit()
+    return order_id
+
+
+async def _assert_untouched(session: AsyncSession, order_id: int, content: dict[str, Any]) -> None:
+    assert (await fresh_order(session, order_id)).status is S.WAITING_FOR_DATA_CONFIRMATION
+    [draft] = await versions(session, order_id)
+    assert draft.status is VersionStatus.DRAFT
+    assert draft.content == content
+    assert content_digest(draft.content) == content_digest(content)
+
+
+async def test_consent_confirms_requirements_keeping_unsupported_volume(
+    session: AsyncSession,
+) -> None:
+    order_id = await order_with_draft(session, UNSUPPORTED, status=S.WAITING_FOR_DATA_CONFIRMATION)
+
+    version = await confirm_requirements(
+        session, order_id, content_digest(UNSUPPORTED), without_volume=True
+    )
+
+    assert version.status is VersionStatus.CONFIRMED
+    assert version.content == UNSUPPORTED  # подтверждено ровно то, что видел пользователь
+    assert (await fresh_order(session, order_id)).status is S.PREPARING_PLAN
+
+
+@pytest.mark.parametrize("content", [UNSUPPORTED, LEGACY, LEGACY_WITHOUT_KEY])
+async def test_plain_confirm_of_unsupported_volume_is_refused(
+    session: AsyncSession, content: dict[str, Any]
+) -> None:
+    order_id = await _legacy_order(session, content)
+
+    with pytest.raises(RequirementsVolumeConsentError):
+        await confirm_requirements(session, order_id, content_digest(content))
+    await session.rollback()
+
+    await _assert_untouched(session, order_id, content)
+
+
+async def test_consent_without_unsupported_volume_is_refused(session: AsyncSession) -> None:
+    order_id = await order_with_draft(session, FULL, status=S.WAITING_FOR_DATA_CONFIRMATION)
+
+    with pytest.raises(RequirementsVolumeConsentError):
+        await confirm_requirements(session, order_id, content_digest(FULL), without_volume=True)
+    await session.rollback()
+
+    await _assert_untouched(session, order_id, FULL)
+
+
+@pytest.mark.parametrize("content", [LEGACY, LEGACY_WITHOUT_KEY])
+async def test_consent_moves_legacy_volume_and_confirms(
+    session: AsyncSession, content: dict[str, Any]
+) -> None:
+    order_id = await _legacy_order(session, content)
+
+    version = await confirm_requirements(
+        session, order_id, content_digest(content), without_volume=True
+    )
+    await session.commit()
+
+    assert version.content == UNSUPPORTED
+    [confirmed] = await versions(session, order_id)
+    assert (confirmed.status, confirmed.content) == (VersionStatus.CONFIRMED, UNSUPPORTED)
+    assert (await fresh_order(session, order_id)).status is S.PREPARING_PLAN
+
+
+async def test_consent_under_stale_digest_moves_nothing(session: AsyncSession) -> None:
+    """Отпечаток сверяется с тем, что видел пользователь, — до переноса объёма."""
+    order_id = await _legacy_order(session, LEGACY)
+
+    for stale in (content_digest(UNSUPPORTED), content_digest({**LEGACY, "topic": "Другая"})):
+        with pytest.raises(RequirementsChangedError):
+            await confirm_requirements(session, order_id, stale, without_volume=True)
+        await session.rollback()
+
+    await _assert_untouched(session, order_id, LEGACY)
+
+
+@pytest.mark.parametrize("failing", ["confirm_requirements_version", "change_status"])
+async def test_consent_failure_after_transfer_leaves_legacy_draft_intact(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    """Перенос и подтверждение — одна транзакция: сбой после переноса откатывает и его."""
+    order_id = await _legacy_order(session, LEGACY)
+    original = getattr(dialog_service, failing)
+    moved: list[Any] = []
+
+    async def fail(session_: AsyncSession, order_id_: int, *args: Any, **kwargs: Any) -> Any:
+        [draft] = await versions(session_, order_id_)
+        moved.append(dict(draft.content))  # перенос уже записан в этой транзакции
+        if failing == "change_status":
+            await original(session_, order_id_, *args, **kwargs)
+        raise OperationalError("UPDATE ...", {}, Exception("db down"))
+
+    if failing == "change_status":
+        # Подтверждение версии проходит, падает смена статуса.
+        monkeypatch.setattr(dialog_service, "change_status", fail)
+    else:
+        monkeypatch.setattr(dialog_service, "confirm_requirements_version", fail)
+
+    with pytest.raises(OperationalError):
+        await confirm_requirements(session, order_id, content_digest(LEGACY), without_volume=True)
+    await session.rollback()
+
+    assert moved == [UNSUPPORTED]
+    await _assert_untouched(session, order_id, LEGACY)

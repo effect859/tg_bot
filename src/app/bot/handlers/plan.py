@@ -38,6 +38,7 @@ from app.domain.errors import (
     OrderNotFoundError,
     PlanChangedError,
     PlanLimitReachedError,
+    PlanTargetPagesUnsupportedError,
 )
 from app.domain.plan import PlanOutcome, PlanOutcomeKind
 from app.domain.requirements_dialog import content_digest
@@ -45,7 +46,11 @@ from app.llm.base import LLMClient
 from app.services.billing import ChargeOutcomeKind, pay_order
 from app.services.orders import get_user_order
 from app.services.plan_confirmation import confirm_plan
-from app.services.plan_generation import generate_plan, restart_plan_generation
+from app.services.plan_generation import (
+    TARGET_PAGES_UNSUPPORTED,
+    generate_plan,
+    restart_plan_generation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +96,10 @@ async def retry_plan(
             refusal = texts.action_outdated(order)
         await session.rollback()
         await callback.answer(refusal, show_alert=True)
+        return
+    except PlanTargetPagesUnsupportedError:
+        await session.rollback()
+        await callback.answer(texts.PLAN_TARGET_PAGES_UNSUPPORTED, show_alert=True)
         return
     except PlanLimitReachedError:
         await session.rollback()
@@ -140,6 +149,11 @@ def plan_reply(outcome: PlanOutcome) -> tuple[str, InlineKeyboardMarkup | None] 
             return texts.plan_view(order_id, outcome.plan), markup
         case K.RETRY_LATER:
             return texts.PLAN_DELAYED, cancel_order_keyboard(order_id)
+        case K.FAILED if outcome.error_code == TARGET_PAGES_UNSUPPORTED:
+            return (
+                texts.plan_target_pages_unsupported(order_id),
+                plan_failed_keyboard(order_id, can_retry=False),
+            )
         case K.FAILED:
             return (
                 texts.plan_failed(order_id, can_retry=outcome.can_retry),

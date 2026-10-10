@@ -44,6 +44,7 @@ from app.domain.enums import OrderStatus, VersionStatus
 from app.domain.requirements import REQUIRED_FIELDS
 from app.domain.requirements_dialog import AnswerError, content_digest
 from app.services import orders
+from app.services import requirements_dialog as requirements_dialog_service
 from app.services.requirements_analysis import AnalysisOutcome, AnalysisOutcomeKind
 from app.services.requirements_dialog import AnswerOutcome
 from app.services.requirements_dialog import AnswerOutcomeKind as AnswerKind
@@ -991,8 +992,9 @@ async def test_confirm_database_error_rolls_back_without_logging_data(
     )
     real_confirm = requirements_dialog.confirm_requirements
 
-    async def failing_after_write(session_: AsyncSession, *args: Any) -> Any:
-        await real_confirm(session_, *args)  # версия подтверждена, статус сменён — не зафиксировано
+    async def failing_after_write(session_: AsyncSession, *args: Any, **kwargs: Any) -> Any:
+        # Версия подтверждена, статус сменён — не зафиксировано.
+        await real_confirm(session_, *args, **kwargs)
         raise _db_error(SECRET_CONTENT)
 
     monkeypatch.setattr(requirements_dialog, "confirm_requirements", failing_after_write)
@@ -1046,3 +1048,177 @@ async def test_confirm_commit_error_is_handled_safely(
     bot.send_message.assert_not_awaited()
     _assert_log_is_safe(caplog)
     assert (await fresh_order(session, order_id)).status is S.WAITING_FOR_DATA_CONFIRMATION
+
+
+# --- Неподдерживаемый объём: предупреждение и согласие (Stage 3.10) ------------------
+
+UNSUPPORTED = {**FULL, "target_pages": None, "unsupported_target_pages": 150}
+LEGACY = {**FULL, "target_pages": 150}  # объём в target_pages, как до Stage 3.10
+HUGE = 10**499 + 7
+
+
+@pytest.mark.parametrize("content", [UNSUPPORTED, LEGACY])
+async def test_summary_warns_and_offers_consent(
+    session: AsyncSession, content: dict[str, Any]
+) -> None:
+    user = await _user(session)
+    order_id = await order_with_draft(session, content, status=S.WAITING_FOR_DATA_CONFIRMATION)
+    message = AsyncMock()
+
+    await cmd_start(message, AsyncMock(), user, session)
+
+    summary = _answers(message)[1]
+    assert summary == texts.requirements_summary(order_id, content)
+    assert texts.volume_unsupported_warning(150) in summary
+    assert summary.count("150 стр.") == 1  # исходный объём — один раз, в предупреждении
+    assert texts.REQUIREMENTS_VOLUME_PROMPT in summary
+    assert texts.REQUIREMENTS_CONFIRM_PROMPT not in summary
+    markup = _markups(message)[1]
+    assert _req_actions(markup) == ["no_volume", "edit", "cancel"]
+    assert markup.inline_keyboard[0][0].text == texts.BTN_CONFIRM_WITHOUT_VOLUME
+    data = RequirementsCallback.unpack(_callback_datas(markup)[0])
+    assert data.digest == content_digest(content)
+    assert all(len(d.encode()) <= 64 for d in _callback_datas(markup))
+
+
+def test_supported_volume_summary_has_no_warning() -> None:
+    summary = texts.requirements_summary(1, FULL)
+
+    assert "⚠️" not in summary
+    assert "25 стр." in summary
+    assert texts.REQUIREMENTS_CONFIRM_PROMPT in summary
+
+
+def test_summary_with_longest_unsupported_volume_fits_telegram_limit() -> None:
+    """Число не сокращается (обрезанное число неверно): резюме всё равно укладывается."""
+    worst = {
+        **FULL,
+        "topic": "&" * 500,
+        "practice_type": "<" * 255,
+        "practice_place": ">" * 255,
+        "university": "&" * 255,
+        "student_name": "&" * 255,
+        "specialty": "&" * 255,
+        "student_group": "&" * 255,
+        "supervisor": "&" * 255,
+        "extra_requirements": ["&" * 500] * 20,
+        "target_pages": None,
+        "unsupported_target_pages": HUGE,
+    }
+
+    summary = texts.requirements_summary(10**12, worst)
+
+    assert len(summary) <= texts.MAX_MESSAGE_CHARS
+    assert str(HUGE) in summary
+
+
+async def _consent(
+    session: AsyncSession,
+    user: User,
+    order_id: int,
+    digest: str,
+    callback: AsyncMock | None = None,
+    bot: AsyncMock | None = None,
+) -> AsyncMock:
+    callback = callback or _callback(user.tg_id)
+    data = _req(RequirementsAction.CONFIRM_WITHOUT_VOLUME, order_id, digest=digest)
+    await confirm_requirements_button(callback, data, session, user, bot or AsyncMock())
+    return callback
+
+
+@pytest.mark.parametrize("content", [UNSUPPORTED, LEGACY])
+async def test_consent_confirms_without_volume(
+    session: AsyncSession, content: dict[str, Any]
+) -> None:
+    user = await _user(session)
+    order_id = await order_with_draft(session, content, status=S.WAITING_FOR_DATA_CONFIRMATION)
+    bot = AsyncMock()
+
+    callback = await _consent(session, user, order_id, content_digest(content), bot=bot)
+
+    callback.answer.assert_awaited_once_with()
+    assert _sent(bot) == [texts.REQUIREMENTS_CONFIRMED]
+    assert (await fresh_order(session, order_id)).status is S.PREPARING_PLAN
+    [version] = await versions(session, order_id)
+    assert (version.status, version.content) == (VersionStatus.CONFIRMED, UNSUPPORTED)
+
+
+@pytest.mark.parametrize(
+    ("content", "action"),
+    [
+        (UNSUPPORTED, RequirementsAction.CONFIRM),
+        (LEGACY, RequirementsAction.CONFIRM),
+        (FULL, RequirementsAction.CONFIRM_WITHOUT_VOLUME),
+    ],
+)
+async def test_button_not_matching_volume_is_refused(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    content: dict[str, Any],
+    action: RequirementsAction,
+) -> None:
+    user = await _user(session)
+    order_id = await order_with_draft(session, content, status=S.WAITING_FOR_DATA_CONFIRMATION)
+    callback = _callback()
+    bot = AsyncMock()
+    log = _Order(session, monkeypatch)
+    log.telegram(callback.answer, "alert")
+    data = _req(action, order_id, digest=content_digest(content))
+
+    await confirm_requirements_button(callback, data, session, user, bot)
+
+    assert log.calls[:2] == ["rollback", "alert"]
+    callback.answer.assert_awaited_once_with(texts.REQUIREMENTS_CHANGED, show_alert=True)
+    # Актуальное резюме с правильной кнопкой.
+    markup = bot.send_message.await_args.kwargs["reply_markup"]
+    expected = "confirm" if content is FULL else "no_volume"
+    assert _req_actions(markup)[0] == expected
+    assert (await fresh_order(session, order_id)).status is S.WAITING_FOR_DATA_CONFIRMATION
+    assert await _content(session, order_id) == content
+
+
+async def test_consent_database_error_rolls_back_transfer(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = await _user(session)
+    order_id = await order_with_draft(session, LEGACY, status=S.WAITING_FOR_DATA_CONFIRMATION)
+
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        raise _db_error(LEGACY)
+
+    monkeypatch.setattr(requirements_dialog_service, "confirm_requirements_version", fail)
+    callback = await _consent(session, user, order_id, content_digest(LEGACY))
+
+    callback.answer.assert_awaited_once_with(texts.REQUIREMENTS_ACTION_FAILED, show_alert=True)
+    assert (await fresh_order(session, order_id)).status is S.WAITING_FOR_DATA_CONFIRMATION
+    [draft] = await versions(session, order_id)
+    assert (draft.status, draft.content) == (VersionStatus.DRAFT, LEGACY)
+
+
+async def test_cancel_instead_of_consent(session: AsyncSession) -> None:
+    user = await _user(session)
+    order_id = await order_with_draft(session, LEGACY, status=S.WAITING_FOR_DATA_CONFIRMATION)
+    callback = _callback(user.tg_id)
+    data = OrderCallback(action=OrderAction.CANCEL, order_id=order_id)
+
+    await cancel_order(callback, data, session, user, AsyncMock())
+
+    assert (await fresh_order(session, order_id)).status is S.CANCELLED
+    [draft] = await versions(session, order_id)
+    assert (draft.status, draft.content) == (VersionStatus.DRAFT, LEGACY)
+
+
+async def test_consent_callback_goes_to_requirements_handler(
+    session: AsyncSession, make_dispatcher: Callable[[], Dispatcher], bot: Bot
+) -> None:
+    order_id = await order_with_draft(
+        session, UNSUPPORTED, status=S.WAITING_FOR_DATA_CONFIRMATION, tg_id=TG_ID
+    )
+    data = _req(
+        RequirementsAction.CONFIRM_WITHOUT_VOLUME, order_id, digest=content_digest(UNSUPPORTED)
+    ).pack()
+
+    await make_dispatcher().feed_update(bot, _callback_update(data))
+
+    assert (await fresh_order(session, order_id)).status is S.PREPARING_PLAN
+    assert _texts_sent(bot) == [texts.REQUIREMENTS_CONFIRMED]

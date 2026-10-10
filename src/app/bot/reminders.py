@@ -24,11 +24,15 @@ from app.bot.keyboards import (
 from app.db.models import Order
 from app.domain.enums import OrderStatus
 from app.domain.errors import VersionNotFoundError
-from app.domain.plan import MAX_PLAN_LLM_CALLS
+from app.domain.plan import MAX_PLAN_LLM_CALLS, unsupported_volume
 from app.domain.requirements import MAX_ANALYSIS_LLM_CALLS
 from app.domain.requirements_dialog import content_digest
 from app.services.billing import get_balance
-from app.services.plan_generation import count_plan_calls, get_plan_draft
+from app.services.plan_generation import (
+    count_plan_calls,
+    get_plan_draft,
+    plan_target_pages_unsupported,
+)
 from app.services.requirements_analysis import count_analysis_calls
 from app.services.requirements_dialog import RequirementsDialog, get_dialog
 
@@ -74,6 +78,11 @@ async def active_order_reminder(session: AsyncSession, order: Order) -> Reply:
         case S.PREPARING_PLAN:
             return texts.plan_in_progress(order.id), cancel_order_keyboard(order.id)
         case S.FAILED if order.failed_from_status is S.PREPARING_PLAN:
+            if await plan_target_pages_unsupported(session, order.id):
+                return (
+                    texts.plan_target_pages_unsupported(order.id),
+                    plan_failed_keyboard(order.id, can_retry=False),
+                )
             calls = await count_plan_calls(session, order.id)
             can_retry = calls < MAX_PLAN_LLM_CALLS
             return (
@@ -126,7 +135,8 @@ def dialog_message(dialog: RequirementsDialog) -> tuple[str, InlineKeyboardMarku
 
 
 def summary_message(dialog: RequirementsDialog) -> tuple[str, InlineKeyboardMarkup]:
+    without_volume = unsupported_volume(dialog.content) is not None
     return (
         texts.requirements_summary(dialog.order_id, dialog.content),
-        confirmation_keyboard(dialog.order_id, dialog.digest),
+        confirmation_keyboard(dialog.order_id, dialog.digest, without_volume=without_volume),
     )

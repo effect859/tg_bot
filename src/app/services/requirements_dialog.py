@@ -19,8 +19,10 @@ from app.domain.errors import (
     InvalidStatusTransitionError,
     OrderNotFoundError,
     RequirementsChangedError,
+    RequirementsVolumeConsentError,
     VersionNotFoundError,
 )
+from app.domain.plan import split_volume, unsupported_volume
 from app.domain.requirements import missing_fields
 from app.domain.requirements_dialog import (
     AnswerError,
@@ -149,22 +151,32 @@ async def start_edit(session: AsyncSession, order_id: int, field: str) -> Requir
 
 
 async def confirm_requirements(
-    session: AsyncSession, order_id: int, digest: str
+    session: AsyncSession, order_id: int, digest: str, *, without_volume: bool = False
 ) -> OrderRequirementsVersion:
     """Подтверждение ТЗ, которое видел пользователь: черновик → CONFIRMED, заказ → PREPARING_PLAN.
 
     ``digest`` — отпечаток содержимого с экрана подтверждения: изменившееся с тех
-    пор ТЗ не подтверждается.
+    пор ТЗ не подтверждается. ``without_volume`` — согласие продолжить без объёма из
+    материалов, который план не выполнит; нужно ровно тогда, когда такой объём есть.
+    Черновик, сохранённый до поля unsupported_target_pages (объём в target_pages),
+    при согласии приводится к нему. Всё — одной транзакцией вызывающего кода: при
+    ошибке откат не оставляет частично изменённого черновика.
 
     Raises InvalidStatusTransitionError (заказ не на подтверждении ТЗ),
-    RequirementsChangedError, VersionNotFoundError.
+    RequirementsChangedError, RequirementsVolumeConsentError, VersionNotFoundError.
     """
     order = await lock_order(session, order_id)
     if order.status is not S.WAITING_FOR_DATA_CONFIRMATION:
         raise InvalidStatusTransitionError(order.status, S.PREPARING_PLAN)
     draft = await _draft(session, order_id)
+    # Отпечаток — от того, что видел пользователь: до переноса объёма.
     if content_digest(draft.content) != digest or missing_fields(draft.content):
         raise RequirementsChangedError(order_id)
+    if without_volume != (unsupported_volume(draft.content) is not None):
+        raise RequirementsVolumeConsentError(order_id)
+    split = split_volume(draft.content)
+    if split != draft.content:
+        draft = await update_requirements_draft(session, order_id, draft.id, split)
     version = await confirm_requirements_version(session, order_id, draft.id)
     await change_status(session, order_id, S.PREPARING_PLAN)
     return version

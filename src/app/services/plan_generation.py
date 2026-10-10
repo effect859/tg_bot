@@ -28,7 +28,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.models import LLMCall, Order, OrderMaterial, OrderMaterialText, User
 from app.domain.enums import LLMCallStatus, MaterialProcessingStatus, OrderStatus, VersionStatus
-from app.domain.errors import InvalidStatusTransitionError, PlanLimitReachedError
+from app.domain.errors import (
+    InvalidStatusTransitionError,
+    PlanLimitReachedError,
+    PlanTargetPagesUnsupportedError,
+)
 from app.domain.plan import (
     MAX_PLAN_ATTEMPTS,
     MAX_PLAN_LLM_CALLS,
@@ -39,6 +43,7 @@ from app.domain.plan import (
     PlanOutcome,
     PlanOutcomeKind,
     plan_requirements,
+    report_pages_supported,
     validate_plan,
 )
 from app.domain.report_generation import MAX_SECTION_PAGES
@@ -70,6 +75,9 @@ NEW_ORDER_GRACE = timedelta(minutes=1)
 RECOVERY_INTERVAL_SECONDS = 60.0
 RECOVERY_BATCH = 5
 NOT_COMPLETED = "not_completed"
+# Объём подтверждённого ТЗ вне MIN_REPORT_PAGES..MAX_REPORT_PAGES: план не составить,
+# повтор бесполезен. Так бывает у ТЗ, подтверждённого до проверки объёма.
+TARGET_PAGES_UNSUPPORTED = "target_pages_unsupported"
 
 PLAN_PROMPT = f"""\
 Ты помогаешь составить план отчёта студента по практике.
@@ -141,14 +149,29 @@ async def restart_plan_generation(session: AsyncSession, order_id: int) -> Order
     упирается в переход. Коммит — забота вызывающего кода.
 
     Raises OrderNotFoundError, InvalidStatusTransitionError (заказ не в сбое плана),
-    PlanLimitReachedError.
+    PlanTargetPagesUnsupportedError, PlanLimitReachedError.
     """
     order = await lock_order(session, order_id)
     if order.status is not S.FAILED or order.failed_from_status is not S.PREPARING_PLAN:
         raise InvalidStatusTransitionError(order.status, S.PREPARING_PLAN)
+    if await plan_target_pages_unsupported(session, order_id):
+        raise PlanTargetPagesUnsupportedError(order_id)
     if await count_plan_calls(session, order_id) >= MAX_PLAN_LLM_CALLS:
         raise PlanLimitReachedError(order_id, MAX_PLAN_LLM_CALLS)
     return await change_status(session, order_id, S.PREPARING_PLAN)
+
+
+async def plan_target_pages_unsupported(session: AsyncSession, order_id: int) -> bool:
+    """В действующем подтверждённом ТЗ объём, под который план не составить.
+
+    После согласия пользователя такой объём хранится в unsupported_target_pages, а
+    target_pages пуст; здесь — ТЗ, подтверждённое до проверки объёма.
+    """
+    versions = await get_requirements_versions(session, order_id)
+    if not versions or versions[-1].status is not VersionStatus.CONFIRMED:
+        return False
+    pages = versions[-1].content.get("target_pages")
+    return pages is not None and not report_pages_supported(pages)
 
 
 async def count_plan_calls(session: AsyncSession, order_id: int) -> int:
@@ -218,6 +241,9 @@ async def _claim(session: AsyncSession, llm: LLMClient, order_id: int) -> _Claim
         order.step_started_at = None
 
     calls = await count_plan_calls(session, order_id)
+    # До учёта попытки и строки llm_calls: такой план не составить, вызов не тратится.
+    if await plan_target_pages_unsupported(session, order_id):
+        return await _fail(session, order_id, TARGET_PAGES_UNSUPPORTED, calls, retryable=False)
     if order.step_attempts >= MAX_PLAN_ATTEMPTS or calls >= MAX_PLAN_LLM_CALLS:
         code = "llm_call_limit" if calls >= MAX_PLAN_LLM_CALLS else "attempts_exhausted"
         return await _fail(session, order_id, code, calls)
@@ -342,11 +368,14 @@ async def _finish(session: AsyncSession, claim: _Claim, attempt: _Attempt) -> Pl
     return outcome
 
 
-async def _fail(session: AsyncSession, order_id: int, code: str, calls: int) -> PlanOutcome:
+async def _fail(
+    session: AsyncSession, order_id: int, code: str, calls: int, *, retryable: bool = True
+) -> PlanOutcome:
     # В order.error — только код: без ТЗ, материалов и ответа модели.
     await change_status(session, order_id, S.FAILED, error=f"{LLM_STEP}: {code}")
     await session.commit()
-    return PlanOutcome(K.FAILED, order_id, can_retry=calls < MAX_PLAN_LLM_CALLS, error_code=code)
+    can_retry = retryable and calls < MAX_PLAN_LLM_CALLS
+    return PlanOutcome(K.FAILED, order_id, can_retry=can_retry, error_code=code)
 
 
 async def _record_call(session: AsyncSession, call_id: int, attempt: _Attempt) -> None:

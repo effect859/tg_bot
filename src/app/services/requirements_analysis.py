@@ -37,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.db.models import LLMCall, Order, OrderMaterial, OrderMaterialText, User
 from app.domain.enums import LLMCallStatus, MaterialProcessingStatus, OrderStatus, VersionStatus
 from app.domain.errors import AnalysisLimitReachedError, InvalidStatusTransitionError
+from app.domain.plan import split_volume
 from app.domain.requirements import (
     ANALYSIS_JSON_SCHEMA,
     MAX_ANALYSIS_ATTEMPTS,
@@ -364,7 +365,9 @@ async def _finish(session: AsyncSession, claim: _Claim, attempt: _Attempt) -> An
 
     extraction = attempt.extraction
     assert extraction is not None
-    await _save_draft(session, claim.order_id, extraction.content)
+    # Объём, под который план не составить, — отдельно: пользователь увидит его и
+    # решит, продолжать ли без него.
+    await _save_draft(session, claim.order_id, split_volume(extraction.content))
     missing = missing_fields(extraction.content)
     target = S.WAITING_FOR_MISSING_DATA if missing else S.WAITING_FOR_DATA_CONFIRMATION
     await change_status(session, claim.order_id, target)

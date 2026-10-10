@@ -191,6 +191,39 @@ async def test_complete_data_goes_to_confirmation(
     assert (await _fresh(session, order_id)).status is S.WAITING_FOR_DATA_CONFIRMATION
 
 
+@pytest.mark.parametrize(
+    ("pages", "target", "unsupported"),
+    [
+        (None, None, None),
+        (3, 3, None),
+        (25, 25, None),
+        (120, 120, None),
+        (1, None, 1),
+        (2, None, 2),
+        (121, None, 121),
+        (500, None, 500),
+        (501, None, 501),
+        (10**499 + 7, None, 10**499 + 7),
+    ],
+)
+async def test_volume_from_materials_is_kept_supported_or_not(
+    session: AsyncSession, pages: int | None, target: int | None, unsupported: int | None
+) -> None:
+    """Stage 3.10: объём вне 3..120 не теряется — он в unsupported_target_pages."""
+    quote = str(pages) if pages is not None and pages > 10**6 else f"Объём отчёта: {pages} стр."
+    fields = {} if pages is None else {"target_pages": (pages, quote)}
+    order_id = await _order(session, f"{MATERIAL}\n{quote}")
+
+    outcome = await analyze_requirements(
+        session, FakeLLMClient(result(response_json(**fields))), order_id
+    )
+
+    assert outcome.kind is K.COMPLETED
+    [draft] = await _versions(session, order_id)
+    assert draft.content["target_pages"] == target
+    assert draft.content["unsupported_target_pages"] == unsupported
+
+
 async def test_oversized_materials_are_truncated_explicitly(session: AsyncSession) -> None:
     first = "А" * 300_000
     second = MATERIAL + " " + "Б" * 200_000  # не помещается целиком

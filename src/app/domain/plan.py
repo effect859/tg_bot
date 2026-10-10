@@ -16,7 +16,7 @@ from pydantic import ValidationError
 
 from app.domain.enums import OrderStatus
 from app.domain.report_generation import MAX_SECTION_PAGES
-from app.domain.requirements import MAX_TARGET_PAGES, AnalysisInput, normalize_whitespace
+from app.domain.requirements import AnalysisInput, normalize_whitespace
 from app.domain.schemas import PlanContent
 
 # Поля подтверждённого ТЗ, которые нужны для плана. ФИО, вуз, руководитель и группа
@@ -48,7 +48,47 @@ MAX_REQUIREMENTS = 10
 MAX_REQUIREMENT_CHARS = 300
 # Сырое число страниц от модели: вес при распределении объёма ТЗ или объём раздела
 # без ТЗ. Объём раздела в принятом плане ограничен MAX_SECTION_PAGES генератора.
-MAX_PAGE_WEIGHT = MAX_TARGET_PAGES
+MAX_PAGE_WEIGHT = 500
+
+# Объём отчёта из ТЗ, под который план вообще можно составить: не меньше страницы на
+# раздел и не больше MAX_SECTION_PAGES на каждый из MAX_SECTIONS разделов.
+MIN_REPORT_PAGES = MIN_SECTIONS
+MAX_REPORT_PAGES = MAX_SECTIONS * MAX_SECTION_PAGES
+
+
+# --- Объём отчёта из ТЗ --------------------------------------------------------------
+
+
+def report_pages_supported(pages: int) -> bool:
+    """Объём ТЗ, под который составляется план (MIN_REPORT_PAGES..MAX_REPORT_PAGES)."""
+    return MIN_REPORT_PAGES <= pages <= MAX_REPORT_PAGES
+
+
+def unsupported_volume(content: dict[str, Any]) -> int | None:
+    """Неподдерживаемый объём из ТЗ, требующий согласия пользователя; None — такого нет.
+
+    Объём хранится в unsupported_target_pages; в черновике, сохранённом до этого
+    поля, он может стоять в target_pages.
+    """
+    unsupported = content.get("unsupported_target_pages")
+    if unsupported is not None:
+        return int(unsupported)
+    pages = content.get("target_pages")
+    if pages is not None and not report_pages_supported(pages):
+        return int(pages)
+    return None
+
+
+def split_volume(content: dict[str, Any]) -> dict[str, Any]:
+    """ТЗ, где неподдерживаемый объём перенесён из target_pages в unsupported_target_pages.
+
+    target_pages остаётся только поддерживаемым объёмом: его соблюдает план. Исходное
+    требование не теряется — пользователь видит его и соглашается работать без него.
+    """
+    pages = content.get("target_pages")
+    if pages is None or report_pages_supported(pages):
+        return dict(content)
+    return {**content, "target_pages": None, "unsupported_target_pages": pages}
 
 
 # --- Вход модели -------------------------------------------------------------------

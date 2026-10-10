@@ -35,6 +35,7 @@ from app.domain.errors import (
     OrderNotFoundError,
     RequirementFieldNotEditableError,
     RequirementsChangedError,
+    RequirementsVolumeConsentError,
     VersionNotFoundError,
 )
 from app.llm.base import LLMClient
@@ -150,7 +151,11 @@ async def _reply_to_answer(
 # --- Подтверждение и изменение ТЗ --------------------------------------------------
 
 
-@router.callback_query(RequirementsCallback.filter(F.action == RequirementsAction.CONFIRM))
+@router.callback_query(
+    RequirementsCallback.filter(
+        F.action.in_({RequirementsAction.CONFIRM, RequirementsAction.CONFIRM_WITHOUT_VOLUME})
+    )
+)
 async def confirm_requirements_button(
     callback: CallbackQuery,
     callback_data: RequirementsCallback,
@@ -159,12 +164,16 @@ async def confirm_requirements_button(
     bot: Bot,
     llm_client: LLMClient | None = None,
 ) -> None:
-    """«Подтвердить ТЗ»: WAITING_FOR_DATA_CONFIRMATION -> PREPARING_PLAN, затем план.
+    """«Подтвердить ТЗ» или «Продолжить без объёма»: WAITING_FOR_DATA_CONFIRMATION ->
+    PREPARING_PLAN, затем план.
 
     Под блокировкой заказа: двойное нажатие упирается в статус, кнопка под
-    устаревшим резюме — в отпечаток содержимого. План составляется в этом же
+    устаревшим резюме — в отпечаток содержимого, кнопка не того вида (согласие без
+    неподдерживаемого объёма и наоборот) — в проверку согласия. Подтверждение и
+    приведение старого черновика — один commit. План составляется в этом же
     апдейте, если подключён LLM-клиент; иначе заказ ждёт прохода восстановления.
     """
+    without_volume = callback_data.action is RequirementsAction.CONFIRM_WITHOUT_VOLUME
     try:
         order = await get_user_order(session, user.id, callback_data.order_id)
     except OrderNotFoundError:
@@ -173,7 +182,9 @@ async def confirm_requirements_button(
         return
     order_id = order.id
     try:
-        await confirm_requirements(session, order_id, callback_data.digest)
+        await confirm_requirements(
+            session, order_id, callback_data.digest, without_volume=without_volume
+        )
         await session.commit()
     except InvalidStatusTransitionError:
         # lock_order обновил order актуальным статусом; текст — до rollback.
@@ -184,7 +195,7 @@ async def confirm_requirements_button(
         await session.rollback()
         await callback.answer(refusal, show_alert=True)
         return
-    except RequirementsChangedError:
+    except (RequirementsChangedError, RequirementsVolumeConsentError):
         await session.rollback()
         await callback.answer(texts.REQUIREMENTS_CHANGED, show_alert=True)
         await _send_current_dialog(callback, bot, session, order_id)

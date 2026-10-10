@@ -30,12 +30,22 @@ class PracticeReportRequirements(_Strict):
     student_group: str | None = None
     supervisor: str | None = None
     target_pages: int | None = Field(default=None, ge=1)
+    # Объём из материалов, под который план не составить: план идёт без объёма, если
+    # пользователь согласился. strict — bool, строки и float не принимаются за число.
+    # Нет в версиях, сохранённых до этого поля: для них оно None.
+    unsupported_target_pages: int | None = Field(default=None, ge=1, strict=True)
     extra_requirements: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check_period(self) -> "PracticeReportRequirements":
         if self.practice_start and self.practice_end and self.practice_start > self.practice_end:
             raise ValueError("practice_start must not be after practice_end")
+        return self
+
+    @model_validator(mode="after")
+    def _check_volume(self) -> "PracticeReportRequirements":
+        if self.target_pages is not None and self.unsupported_target_pages is not None:
+            raise ValueError("target_pages and unsupported_target_pages are exclusive")
         return self
 
 

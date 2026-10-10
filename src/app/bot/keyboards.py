@@ -32,6 +32,8 @@ class OrderCallback(CallbackData, prefix="order"):
 
 class RequirementsAction(StrEnum):
     CONFIRM = "confirm"
+    # Подтверждение ТЗ с согласием работать без неподдерживаемого объёма.
+    CONFIRM_WITHOUT_VOLUME = "no_volume"
     EDIT = "edit"
     EDIT_FIELD = "field"
 
@@ -213,18 +215,21 @@ def _requirements_button(
     return InlineKeyboardButton(text=text, callback_data=data.pack())
 
 
-def confirmation_keyboard(order_id: int, digest: str) -> InlineKeyboardMarkup:
-    """Экран подтверждения ТЗ: подтвердить, изменить обязательное поле или отменить заказ."""
+def confirmation_keyboard(
+    order_id: int, digest: str, *, without_volume: bool = False
+) -> InlineKeyboardMarkup:
+    """Экран подтверждения ТЗ: подтвердить, изменить обязательное поле или отменить заказ.
+
+    ``without_volume`` — объём из материалов не поддерживается: вместо «Подтвердить ТЗ»
+    кнопка согласия продолжить без него.
+    """
+    if without_volume:
+        text, action = texts.BTN_CONFIRM_WITHOUT_VOLUME, RequirementsAction.CONFIRM_WITHOUT_VOLUME
+    else:
+        text, action = texts.BTN_CONFIRM_REQUIREMENTS, RequirementsAction.CONFIRM
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                _requirements_button(
-                    texts.BTN_CONFIRM_REQUIREMENTS,
-                    RequirementsAction.CONFIRM,
-                    order_id,
-                    digest=digest,
-                )
-            ],
+            [_requirements_button(text, action, order_id, digest=digest)],
             [_requirements_button(texts.BTN_EDIT_REQUIREMENTS, RequirementsAction.EDIT, order_id)],
             [_order_button(texts.BTN_CANCEL_ORDER, OrderAction.CANCEL, order_id)],
         ]
