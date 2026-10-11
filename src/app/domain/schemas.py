@@ -35,6 +35,9 @@ class PracticeReportRequirements(_Strict):
     # Нет в версиях, сохранённых до этого поля: для них оно None.
     unsupported_target_pages: int | None = Field(default=None, ge=1, strict=True)
     extra_requirements: list[str] = Field(default_factory=list)
+    # Источники, перечисленные в материалах (каждый подтверждён цитатой): список
+    # литературы отчёта. Нет в версиях, сохранённых до этого поля: для них пусто.
+    references: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check_period(self) -> "PracticeReportRequirements":

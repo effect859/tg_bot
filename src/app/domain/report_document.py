@@ -9,14 +9,18 @@
 управляющих (в том числе переводов строк и табуляции) и без суррогатов.
 
 Здесь проверяются данные, а не возможности конкретного рендерера: у title_page и
-references — символы и общий размер документа. Поддерживает ли рендерер титульный
-лист и список литературы, решает сам рендерер (сейчас DOCX отклоняет непустые).
+references — символы и общий размер документа. Какие поля титульного листа он
+знает, решает сам рендерер.
+
+Нумерация заголовков — общая для показа плана и документа (heading_numbers):
+структурные элементы по ГОСТ 7.32 («Введение», «Заключение») не нумеруются.
 
 Ошибка несёт код и путь до места (``sections[1].subsections[0].paragraphs[2]``), но
 не сам текст: текст отчёта не попадает в логи.
 """
 
 import re
+from collections.abc import Sequence
 from enum import StrEnum
 
 from app.generation.schemas import DocumentContent, Section
@@ -47,9 +51,34 @@ class DocumentErrorCode(StrEnum):
     SURROGATE_CHARACTER = "surrogate_character"
     TOO_MANY_HEADINGS = "too_many_headings"
     TOO_LARGE = "too_large"
+    # Поле титульного листа, которого рендерер не знает.
     TITLE_PAGE_UNSUPPORTED = "title_page_unsupported"
-    REFERENCES_UNSUPPORTED = "references_unsupported"
     UNSUPPORTED_DOC_TYPE = "unsupported_doc_type"
+
+
+# Структурные элементы отчёта (ГОСТ 7.32): заголовок без номера, по центру.
+STRUCTURAL_TITLES = frozenset({"введение", "заключение"})
+
+
+def is_structural(title: str) -> bool:
+    """«Введение», «Заключение» — без учёта регистра и лишних пробелов."""
+    return " ".join(title.split()).casefold() in STRUCTURAL_TITLES
+
+
+def heading_numbers(titles: Sequence[str]) -> list[str | None]:
+    """Номера разделов по порядку; None — структурный элемент без номера.
+
+    Основные разделы нумеруются с 1, структурные элементы номер не занимают.
+    """
+    numbers: list[str | None] = []
+    counter = 0
+    for title in titles:
+        if is_structural(title):
+            numbers.append(None)
+        else:
+            counter += 1
+            numbers.append(str(counter))
+    return numbers
 
 
 class InvalidDocumentError(Exception):

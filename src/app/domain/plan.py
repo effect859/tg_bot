@@ -197,6 +197,8 @@ def validate_plan(raw: Any, target_pages: int | None) -> dict[str, Any]:
 
     sections = [_section(item) for item in items]
     _check_unique([s["title"] for s in sections], "section")
+    if any(is_references_title(s["title"]) for s in sections):
+        raise InvalidPlanResponse("references section is added by the system")
 
     if target_pages is not None:
         if target_pages < len(sections):
@@ -224,6 +226,17 @@ def oversized_sections(plan: dict[str, Any]) -> list[int]:
         for index, section in enumerate(plan["sections"])
         if (pages := section.get("target_pages")) is not None and pages > MAX_SECTION_PAGES
     ]
+
+
+# Раздел «Список литературы / источников» планировать нельзя: список добавляет
+# система из источников, подтверждённых цитатами из материалов, а текст такого
+# раздела модель могла бы только выдумать.
+_REFERENCES_TITLE = re.compile(r"^(список\b.*(литератур|источник)|библиограф)")
+
+
+def is_references_title(title: str) -> bool:
+    """Название раздела со списком литературы или источников (без учёта регистра)."""
+    return _REFERENCES_TITLE.match(" ".join(title.split()).casefold()) is not None
 
 
 def _section(item: Any) -> dict[str, Any]:

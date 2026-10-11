@@ -9,16 +9,21 @@ A4, поля, Times New Roman 14, интервал 1,5, абзацный отс�
 Heading 1, Heading 2), а не прямым форматированием абзацев; темы шрифтов и цвета
 шаблона python-docx заменяются явными значениями.
 
-Структура: «СОДЕРЖАНИЕ» с полем TOC (уровни заголовков 1–2), затем разделы —
-каждый с новой страницы. Нумерация «1.», «1.1.» — по положению раздела в
-документе, а не по названию; номер входит в текст заголовка, поэтому виден в
-оглавлении и в любом редакторе. Номера страниц оглавления рендерер не считает:
-поле TOC заполняет Word или LibreOffice при открытии или обновлении полей.
+Структура: титульный лист (если есть title_page) — страница 1 без номера; затем
+«СОДЕРЖАНИЕ» с полем TOC (уровни заголовков 1–2), разделы — каждый с новой
+страницы, и «СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ» (если есть references). Нумерация
+«1.», «1.1.» — по положению основного раздела (heading_numbers); «Введение»,
+«Заключение» и список источников — структурные элементы ГОСТ: заглавными, по
+центру, без номера. Номер входит в текст заголовка, поэтому виден в оглавлении и в
+любом редакторе. Номера страниц оглавления рендерер не считает: поле TOC заполняет
+Word или LibreOffice при открытии или обновлении полей.
+
+Титульный лист — поля TITLE_PAGE_FIELDS; пустое поле выводится линией для
+заполнения от руки, неизвестное поле отклоняется до создания документа.
 
 Строки оглавления оформлены явными стилями toc 1 и toc 2. Из пакета убраны
 артефакты шаблона python-docx (миниатюра, свойства приложения, customXml,
-stylesWithEffects, w14:docId). Титульного листа и списка литературы рендерер пока
-не поддерживает: непустые title_page и references отклоняются до создания документа.
+stylesWithEffects, w14:docId).
 
 Результат детерминирован: одинаковый документ — одинаковые байты (метаданные без
 дат и автора, у записей ZIP фиксированное время).
@@ -45,8 +50,10 @@ from app.domain.enums import DocType
 from app.domain.report_document import (
     DocumentErrorCode,
     InvalidDocumentError,
+    heading_numbers,
     validate_document_content,
 )
+from app.domain.title_page import TITLE_PAGE_FIELDS
 from app.generation.schemas import DocumentContent, Section
 
 DOCX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -99,6 +106,14 @@ GOST_7_32 = Layout(
     toc_level_indent_cm=1.25,
 )
 
+REFERENCES_TITLE = "СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ"
+# Линия вместо данных, которых нет: титульный лист заполняется от руки.
+BLANK_LINE = "_" * 30
+# Длинные вуз, место практики и тема — мельче, чтобы титульный лист уместился на одной
+# странице при предельных значениях ТЗ (проверено в Word). Текст не сокращается.
+TITLE_PAGE_LONG_VALUE_CHARS = 150
+TITLE_PAGE_LONG_VALUE_FONT_PT = 12
+
 # Время записей ZIP: самое раннее, допустимое форматом.
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _THEME_FONT_ATTRIBUTES = ("w:asciiTheme", "w:hAnsiTheme", "w:eastAsiaTheme", "w:cstheme")
@@ -117,21 +132,27 @@ class PracticeReportDocxRenderer:
         """Raises InvalidDocumentError — до создания документа."""
         if content.doc_type is not DocType.PRACTICE_REPORT:
             raise InvalidDocumentError(DocumentErrorCode.UNSUPPORTED_DOC_TYPE, "doc_type")
-        # Возможности этого рендерера: титульного листа и списка литературы пока нет —
-        # непустые не выводятся молча, а отклоняются.
-        if content.title_page:
-            raise InvalidDocumentError(DocumentErrorCode.TITLE_PAGE_UNSUPPORTED, "title_page")
-        if content.references:
-            raise InvalidDocumentError(DocumentErrorCode.REFERENCES_UNSUPPORTED, "references")
+        # Поля титульного листа знает этот рендерер: незнакомое не теряется молча.
+        for index, key in enumerate(content.title_page):
+            if key not in TITLE_PAGE_FIELDS:
+                raise InvalidDocumentError(
+                    DocumentErrorCode.TITLE_PAGE_UNSUPPORTED, f"title_page.keys[{index}]"
+                )
         validate_document_content(content)
 
+        has_title_page = bool(content.title_page)
         document = Document()
         self._setup_styles(document)
         self._add_toc_styles(document)
-        self._setup_page(document)
-        self._add_table_of_contents(document)
-        for number, section in enumerate(content.sections, start=1):
-            self._add_section(document, section, str(number), level=1)
+        self._setup_page(document, title_page=has_title_page)
+        if has_title_page:
+            self._add_title_page(document, content.title_page)
+        self._add_table_of_contents(document, new_page=has_title_page)
+        numbers = heading_numbers([section.title for section in content.sections])
+        for number, section in zip(numbers, content.sections, strict=True):
+            self._add_section(document, section, number, level=1)
+        if content.references:
+            self._add_references(document, content.references)
         _set_metadata(document, content.title)
         _strip_template_artifacts(document)
 
@@ -212,7 +233,7 @@ class PracticeReportDocxRenderer:
                 Mm(layout.text_width_mm), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS
             )
 
-    def _setup_page(self, document: DocxDocument) -> None:
+    def _setup_page(self, document: DocxDocument, *, title_page: bool) -> None:
         layout = self._layout
         for section in document.sections:
             section.orientation = WD_ORIENT.PORTRAIT
@@ -225,13 +246,71 @@ class PracticeReportDocxRenderer:
             footer = section.footer.paragraphs[0]
             _centered(footer)
             _add_field(footer, "PAGE")
+            if title_page:
+                # Титульный лист — страница 1 без номера (w:titlePg и пустой колонтитул
+                # первой страницы); со второй страницы номер есть.
+                section.different_first_page_header_footer = True
+                section.first_page_footer.is_linked_to_previous = False
 
     # --- Содержимое ------------------------------------------------------------------
 
-    def _add_table_of_contents(self, document: DocxDocument) -> None:
+    def _add_title_page(self, document: DocxDocument, fields: dict[str, str]) -> None:
+        """Типовой титульный лист: известное — из ТЗ, остальное — линии для заполнения."""
+
+        def value(key: str) -> str:
+            return fields.get(key) or BLANK_LINE
+
+        def long(key: str) -> bool:
+            return len(fields.get(key) or "") > TITLE_PAGE_LONG_VALUE_CHARS
+
+        def line(
+            text: str,
+            *,
+            left: bool = False,
+            bold: bool = False,
+            before: int = 0,
+            small: bool = False,
+        ) -> None:
+            paragraph = document.add_paragraph(text)
+            paragraph_format = paragraph.paragraph_format
+            paragraph_format.alignment = (
+                WD_ALIGN_PARAGRAPH.LEFT if left else WD_ALIGN_PARAGRAPH.CENTER
+            )
+            paragraph_format.first_line_indent = Cm(0)
+            paragraph_format.line_spacing = 1.0
+            paragraph_format.space_before = Pt(before)
+            if bold:
+                paragraph.runs[0].bold = True
+            if small:
+                paragraph.runs[0].font.size = Pt(TITLE_PAGE_LONG_VALUE_FONT_PT)
+
+        line(value("university"), small=long("university"))
+        line(f"Факультет (институт): {value('faculty')}")
+        line(f"Кафедра: {value('department')}")
+        line("ОТЧЁТ", bold=True, before=36)
+        line("о прохождении практики", bold=True)
+        line(f"Вид практики: {value('practice_type')}", before=12)
+        line(
+            f"Место прохождения практики: {value('practice_place')}",
+            small=long("practice_place"),
+        )
+        line(f"Тема: {value('topic')}", small=long("topic"))
+        line(f"Сроки практики: {value('practice_period')}")
+        line(f"Студент: {value('student_name')}", left=True, before=24)
+        line(f"Группа: {value('student_group')}", left=True)
+        line(f"Направление подготовки: {value('specialty')}", left=True)
+        line(f"Руководитель практики от вуза: {value('supervisor')}", left=True)
+        line(
+            f"Руководитель практики от организации: {value('organization_supervisor')}",
+            left=True,
+        )
+        line(f"{value('city')} {value('year')}", before=24)
+
+    def _add_table_of_contents(self, document: DocxDocument, *, new_page: bool) -> None:
         title = document.add_paragraph(self._layout.toc_title)
         _centered(title)
         title.runs[0].bold = True
+        title.paragraph_format.page_break_before = new_page
         field = document.add_paragraph()
         field.paragraph_format.first_line_indent = Cm(0)
         # \o — уровни заголовков, \h — ссылки, \z — без номеров страниц в веб-виде,
@@ -240,13 +319,31 @@ class PracticeReportDocxRenderer:
         _update_fields_on_open(document)
 
     def _add_section(
-        self, document: DocxDocument, section: Section, number: str, *, level: int
+        self, document: DocxDocument, section: Section, number: str | None, *, level: int
     ) -> None:
-        document.add_paragraph(f"{number}. {section.title}", style=f"Heading {level}")
+        """Раздел с номером или — ``number`` None — структурный элемент без номера.
+
+        Заголовок структурного элемента — заглавными и по центру; его подразделы
+        тоже без номеров.
+        """
+        if number is None:
+            text = " ".join(section.title.split()).upper() if level == 1 else section.title
+            heading = document.add_paragraph(text, style=f"Heading {level}")
+            if level == 1:
+                _centered(heading)
+        else:
+            document.add_paragraph(f"{number}. {section.title}", style=f"Heading {level}")
         for text in section.paragraphs:
             document.add_paragraph(text)
         for sub_number, subsection in enumerate(section.subsections, start=1):
-            self._add_section(document, subsection, f"{number}.{sub_number}", level=level + 1)
+            sub = None if number is None else f"{number}.{sub_number}"
+            self._add_section(document, subsection, sub, level=level + 1)
+
+    def _add_references(self, document: DocxDocument, references: list[str]) -> None:
+        """«СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ» — последним, без номера, пункты нумеруются."""
+        _centered(document.add_paragraph(REFERENCES_TITLE, style="Heading 1"))
+        for number, reference in enumerate(references, start=1):
+            document.add_paragraph(f"{number}. {reference}")
 
 
 # --- OOXML внутри python-docx -----------------------------------------------------------

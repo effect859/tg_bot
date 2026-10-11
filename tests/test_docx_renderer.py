@@ -17,12 +17,19 @@ from lxml import etree
 
 from app.domain.enums import DocType
 from app.domain.report_document import DocumentErrorCode, InvalidDocumentError
+from app.domain.title_page import build_title_page
 from app.extraction.base import ExtractionLimits, ExtractionResult
 from app.extraction.docx_text import extract_docx_text
 from app.generation.schemas import DocumentContent, Section
 from app.rendering import docx as docx_module
 from app.rendering.base import DocumentRenderer
-from app.rendering.docx import DOCX_MIME_TYPE, GOST_7_32, PracticeReportDocxRenderer
+from app.rendering.docx import (
+    BLANK_LINE,
+    DOCX_MIME_TYPE,
+    GOST_7_32,
+    REFERENCES_TITLE,
+    PracticeReportDocxRenderer,
+)
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 NS = {"w": W}
@@ -284,22 +291,23 @@ def test_numbering_follows_structure() -> None:
     assert headings == ["1. Первый", "1.1. А", "1.2. Б", "2. Второй", "2.1. В"]
 
 
-def test_numbering_ignores_section_names() -> None:
-    """Без эвристик: «Введение» и «Заключение» нумеруются как все разделы."""
+def test_structural_elements_are_unnumbered() -> None:
+    """ГОСТ 7.32 (Stage 3.11): «Введение» и «Заключение» — без номера, заглавными;
+    основные разделы нумеруются с 1. Остальные названия — как обычные разделы."""
     content = _document(
         Section(title="Введение", paragraphs=["т"]),
         Section(title="Основная часть", paragraphs=["т"]),
-        Section(title="Заключение", paragraphs=["т"]),
+        Section(title="  заключение ", paragraphs=["т"]),
         Section(title="Список литературы", paragraphs=["т"]),
     )
 
     headings = [_text(p) for p in Package(_render(content)).body_paragraphs() if _style_of(p)]
 
     assert headings == [
-        "1. Введение",
-        "2. Основная часть",
-        "3. Заключение",
-        "4. Список литературы",
+        "ВВЕДЕНИЕ",
+        "1. Основная часть",
+        "ЗАКЛЮЧЕНИЕ",
+        "2. Список литературы",
     ]
 
 
@@ -437,22 +445,13 @@ def test_invalid_document_rejected_before_rendering(monkeypatch: pytest.MonkeyPa
             DocumentContent(
                 doc_type=DocType.PRACTICE_REPORT,
                 title="t",
-                title_page={"student_name": "Иванов"},
+                title_page={"rector": "Иванов"},
                 sections=[Section(title="Р", paragraphs=["т"])],
             ),
             DocumentErrorCode.TITLE_PAGE_UNSUPPORTED,
         ),
-        (
-            DocumentContent(
-                doc_type=DocType.PRACTICE_REPORT,
-                title="t",
-                references=["Источник"],
-                sections=[Section(title="Р", paragraphs=["т"])],
-            ),
-            DocumentErrorCode.REFERENCES_UNSUPPORTED,
-        ),
     ],
-    ids=["no-sections", "empty-paragraph", "title-page", "references"],
+    ids=["no-sections", "empty-paragraph", "unknown-title-page-field"],
 )
 def test_invalid_document_raises(content: DocumentContent, code: DocumentErrorCode) -> None:
     with pytest.raises(InvalidDocumentError) as caught:
@@ -519,21 +518,23 @@ def _all_paragraphs(section: Section) -> list[str]:
     return paragraphs
 
 
-# --- Возможности рендерера: титульный лист и литература (Stage 3.3) ----------------------
+# --- Возможности рендерера: поля титульного листа (Stage 3.3, 3.11) ----------------------
 
 
 @pytest.mark.parametrize(
     ("capability", "code"),
     [
-        ({"title_page": {"student_name": "Иванов Иван"}}, DocumentErrorCode.TITLE_PAGE_UNSUPPORTED),
-        ({"references": ["Источник."]}, DocumentErrorCode.REFERENCES_UNSUPPORTED),
+        (
+            {"title_page": {"student_name": "Иванов Иван", "rector": "Петров"}},
+            DocumentErrorCode.TITLE_PAGE_UNSUPPORTED,
+        ),
     ],
-    ids=["title-page", "references"],
+    ids=["unknown-title-page-field"],
 )
 def test_unsupported_capabilities_rejected_before_rendering(
     monkeypatch: pytest.MonkeyPatch, capability: dict[str, Any], code: DocumentErrorCode
 ) -> None:
-    """Данные валидны для домена, но рендерер их не поддерживает: отказ до Document()."""
+    """Данные валидны для домена, но рендерер такого поля не знает: отказ до Document()."""
 
     def no_document() -> None:
         raise AssertionError("rendering started before capability check")
@@ -558,7 +559,7 @@ def test_capability_checked_before_document_validation() -> None:
     content = DocumentContent(
         doc_type=DocType.PRACTICE_REPORT,
         title="t",
-        title_page={"student_name": "Иванов"},
+        title_page={"rector": "Иванов"},
         sections=[Section(title="Р", paragraphs=["до\x00после"])],
     )
 
@@ -713,3 +714,211 @@ def test_page_number_without_title_page() -> None:
     footers = [ref.get(_w("type")) for ref in section.findall("w:footerReference", NS)]
     assert footers == ["default"]
     assert section.findall("w:headerReference", NS) == []
+
+
+# --- Титульный лист и список источников (Stage 3.11) -------------------------------------
+
+R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+FULL_TITLE_PAGE = build_title_page(
+    {
+        "university": "НИУ ВШЭ",
+        "practice_type": "производственная",
+        "practice_place": "ООО «Ёлка» & партнёры",
+        "topic": "Анализ <бизнес-процессов>",
+        "practice_start": "2026-07-01",
+        "practice_end": "2026-07-28",
+        "student_name": "Иванов Иван Иванович",
+        "student_group": "БИ-21-1",
+        "specialty": "Бизнес-информатика",
+        "supervisor": "Петров Пётр Петрович",
+    }
+)
+# Только обязательные поля ТЗ: группы, направления и руководителя нет.
+MINIMAL_TITLE_PAGE = build_title_page(
+    {
+        "university": "НИУ ВШЭ",
+        "practice_type": "учебная",
+        "practice_place": "ООО «Ёлка»",
+        "topic": "Тема",
+        "practice_start": "2026-07-01",
+        "practice_end": "2026-07-28",
+        "student_name": "Иванов Иван Иванович",
+    }
+)
+
+
+def _with(
+    title_page: dict[str, str] | None = None, references: list[str] | None = None
+) -> DocumentContent:
+    return CONTENT.model_copy(
+        update={"title_page": title_page or {}, "references": references or []}
+    )
+
+
+def _footers(package: Package) -> dict[str, Any]:
+    """Нижние колонтитулы по типу (default, first) — через связи document.xml."""
+    [section] = package.xml("word/document.xml").xpath("w:body/w:sectPr", namespaces=NS)
+    rels = package.xml("word/_rels/document.xml.rels")
+    targets = {rel.get("Id"): rel.get("Target") for rel in rels}
+    return {
+        ref.get(_w("type")): package.xml(f"word/{targets[ref.get(f'{{{R}}}id')]}")
+        for ref in section.findall("w:footerReference", NS)
+    }
+
+
+def _title_page_lines(data: bytes) -> list[str]:
+    lines = extract_lines(data)
+    return lines[: lines.index(GOST_7_32.toc_title)]
+
+
+def test_title_page_is_first_page_with_requirements_data() -> None:
+    lines = _title_page_lines(_render(_with(FULL_TITLE_PAGE)))
+
+    assert lines == [
+        "НИУ ВШЭ",
+        f"Факультет (институт): {BLANK_LINE}",
+        f"Кафедра: {BLANK_LINE}",
+        "ОТЧЁТ",
+        "о прохождении практики",
+        "Вид практики: производственная",
+        "Место прохождения практики: ООО «Ёлка» & партнёры",
+        "Тема: Анализ <бизнес-процессов>",
+        "Сроки практики: с 01.07.2026 по 28.07.2026",
+        "Студент: Иванов Иван Иванович",
+        "Группа: БИ-21-1",
+        "Направление подготовки: Бизнес-информатика",
+        "Руководитель практики от вуза: Петров Пётр Петрович",
+        f"Руководитель практики от организации: {BLANK_LINE}",
+        f"{BLANK_LINE} 2026",
+    ]
+
+
+def test_title_page_spacing_fits_one_page() -> None:
+    # Отступы подобраны так, чтобы лист с предельными значениями ТЗ уместился на одной
+    # странице (проверено в Word); остальное — одинарный интервал, шрифт 14 pt по стилю.
+    paragraphs = Package(_render(_with(FULL_TITLE_PAGE))).body_paragraphs()
+    title = paragraphs[: [_text(p) for p in paragraphs].index(GOST_7_32.toc_title)]
+
+    before = {
+        _text(p): int(spacing.get(_w("before")))
+        for p in title
+        if (spacing := p.find("w:pPr/w:spacing", NS)) is not None
+        and spacing.get(_w("before")) != "0"
+    }
+    assert before == {
+        "ОТЧЁТ": 36 * 20,
+        "Вид практики: производственная": 12 * 20,
+        "Студент: Иванов Иван Иванович": 24 * 20,
+        f"{BLANK_LINE} 2026": 24 * 20,
+    }
+    for paragraph in title:
+        assert paragraph.find("w:pPr/w:spacing", NS).get(_w("line")) == "240"
+        assert paragraph.xpath(".//w:sz", namespaces=NS) == []
+
+
+def test_long_title_page_values_use_smaller_font_without_truncation() -> None:
+    limit = docx_module.TITLE_PAGE_LONG_VALUE_CHARS
+    fields = {
+        **FULL_TITLE_PAGE,
+        "university": "У" * (limit + 1),
+        "practice_place": "М" * limit,  # на пределе — обычный размер
+        "topic": "Т" * 500,
+        "specialty": "С" * 255,  # уменьшаются только вуз, место практики и тема
+    }
+    paragraphs = Package(_render(_with(fields))).body_paragraphs()
+    title = paragraphs[: [_text(p) for p in paragraphs].index(GOST_7_32.toc_title)]
+
+    sizes = {
+        _text(p): [int(sz.get(_w("val"))) for sz in p.xpath(".//w:sz", namespaces=NS)]
+        for p in title
+    }
+    small = [docx_module.TITLE_PAGE_LONG_VALUE_FONT_PT * 2]
+    assert sizes.pop("У" * (limit + 1)) == small
+    assert sizes.pop("Тема: " + "Т" * 500) == small
+    assert sizes["Место прохождения практики: " + "М" * limit] == []
+    assert sizes["Направление подготовки: " + "С" * 255] == []
+    assert all(value == [] for value in sizes.values())
+
+
+def test_missing_title_page_data_becomes_blank_lines() -> None:
+    lines = _title_page_lines(_render(_with(MINIMAL_TITLE_PAGE)))
+
+    assert f"Группа: {BLANK_LINE}" in lines
+    assert f"Направление подготовки: {BLANK_LINE}" in lines
+    assert f"Руководитель практики от вуза: {BLANK_LINE}" in lines
+    assert "Студент: Иванов Иван Иванович" in lines
+
+
+def test_title_page_text_is_escaped_in_xml() -> None:
+    document = Package(_render(_with(FULL_TITLE_PAGE))).zip.read("word/document.xml").decode()
+
+    assert "Анализ &lt;бизнес-процессов&gt;" in document
+    assert "«Ёлка» &amp; партнёры" in document
+
+
+def test_title_page_has_no_page_number_and_toc_starts_new_page() -> None:
+    package = Package(_render(_with(FULL_TITLE_PAGE)))
+    [section] = package.xml("word/document.xml").xpath("w:body/w:sectPr", namespaces=NS)
+
+    assert _on(section.find("w:titlePg", NS))
+    footers = _footers(package)
+    assert set(footers) == {"default", "first"}
+    first = footers["first"].xpath(".//w:fldChar | .//w:instrText | .//w:t", namespaces=NS)
+    assert first == []  # первая страница — без номера
+    [paragraph] = footers["default"].xpath("w:p", namespaces=NS)
+    assert _field(paragraph) == (["begin", "separate", "end"], " PAGE ")
+    [toc_title] = [p for p in package.body_paragraphs() if _text(p) == GOST_7_32.toc_title]
+    assert _on(toc_title.find("w:pPr/w:pageBreakBefore", NS))
+
+
+def test_without_title_page_layout_is_unchanged() -> None:
+    package = Package(_render())
+    [section] = package.xml("word/document.xml").xpath("w:body/w:sectPr", namespaces=NS)
+
+    assert section.find("w:titlePg", NS) is None
+    assert set(_footers(package)) == {"default"}
+    assert extract_lines(_render()) == expected_lines(CONTENT)
+
+
+def test_references_are_last_unnumbered_section_with_numbered_items() -> None:
+    references = [
+        "ГОСТ 7.32-2017. Отчёт о научно-исследовательской работе.",
+        "Иванов И. И. Учебник.",
+    ]
+    data = _render(_with(FULL_TITLE_PAGE, references))
+    package = Package(data)
+
+    headings = [_text(p) for p in package.body_paragraphs() if _style_of(p) == "Heading1"]
+    assert headings[-1] == REFERENCES_TITLE
+    [heading] = [p for p in package.body_paragraphs() if _text(p) == REFERENCES_TITLE]
+    assert _attr(heading, "w:pPr/w:jc", "val") == "center"
+    assert extract_lines(data)[-3:] == [
+        REFERENCES_TITLE,
+        "1. ГОСТ 7.32-2017. Отчёт о научно-исследовательской работе.",
+        "2. Иванов И. И. Учебник.",
+    ]
+
+
+def test_no_references_section_without_references() -> None:
+    lines = extract_lines(_render(_with(FULL_TITLE_PAGE)))
+
+    assert REFERENCES_TITLE not in lines
+
+
+def test_structural_heading_is_centered_and_its_subsections_unnumbered() -> None:
+    content = _document(
+        Section(title="Введение", subsections=[Section(title="Цели", paragraphs=["т"])]),
+        Section(title="Анализ", subsections=[Section(title="Сведения", paragraphs=["т"])]),
+    )
+    package = Package(_render(content))
+
+    headings = [(p, _text(p)) for p in package.body_paragraphs() if _style_of(p)]
+    assert [text for _, text in headings] == ["ВВЕДЕНИЕ", "Цели", "1. Анализ", "1.1. Сведения"]
+    assert _attr(headings[0][0], "w:pPr/w:jc", "val") == "center"
+    assert _attr(headings[2][0], "w:pPr/w:jc", "val") is None  # обычный раздел — по стилю
+
+
+def test_render_with_title_page_and_references_is_deterministic() -> None:
+    content = _with(FULL_TITLE_PAGE, ["Источник один.", "Источник два."])
+
+    assert _render(content) == _render(content.model_copy(deep=True))

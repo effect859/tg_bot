@@ -7,15 +7,22 @@ order_report_sections; DOCX читается экстрактором матер
 
 import io
 import zipfile
+from datetime import date
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import OrderPlanVersion, OrderReportSection
+from app.db.models import OrderPlanVersion, OrderReportSection, OrderRequirementsVersion
 from app.domain.enums import VersionStatus
 from app.domain.report_document import validate_document_content
 from app.domain.report_generation import ReportOutcomeKind
-from app.rendering.docx import GOST_7_32, PracticeReportDocxRenderer
+from app.rendering.docx import (
+    BLANK_LINE,
+    GOST_7_32,
+    REFERENCES_TITLE,
+    PracticeReportDocxRenderer,
+)
 from app.services.report_generation import assemble_document, generate_next_section
 from fake_llm import FakeLLMClient
 from report_samples import ALL_GOOD, generating_order
@@ -31,8 +38,43 @@ async def _generated_order(session: AsyncSession) -> int:
     return order_id
 
 
+def _expected_title_page(requirements: dict[str, Any]) -> list[str]:
+    """Титульный лист по данным подтверждённого ТЗ; нет данных — линия (Stage 3.11)."""
+
+    def value(name: str) -> str:
+        return requirements.get(name) or BLANK_LINE
+
+    start = date.fromisoformat(requirements["practice_start"])
+    end = date.fromisoformat(requirements["practice_end"])
+    return [
+        value("university"),
+        f"Факультет (институт): {BLANK_LINE}",
+        f"Кафедра: {BLANK_LINE}",
+        "ОТЧЁТ",
+        "о прохождении практики",
+        f"Вид практики: {value('practice_type')}",
+        f"Место прохождения практики: {value('practice_place')}",
+        f"Тема: {value('topic')}",
+        f"Сроки практики: с {start:%d.%m.%Y} по {end:%d.%m.%Y}",
+        f"Студент: {value('student_name')}",
+        f"Группа: {value('student_group')}",
+        f"Направление подготовки: {value('specialty')}",
+        f"Руководитель практики от вуза: {value('supervisor')}",
+        f"Руководитель практики от организации: {BLANK_LINE}",
+        f"{BLANK_LINE} {end.year}",
+    ]
+
+
 async def _expected_from_db(session: AsyncSession, order_id: int) -> list[str]:
-    """Заголовок оглавления, затем по плану: «N. Название», абзацы, подразделы «N.M.»."""
+    """Титульный лист, заголовок оглавления, затем по плану: «N. Название», абзацы,
+    подразделы «N.M.»; «Введение» и «Заключение» — заглавными, без номера (ГОСТ)."""
+    requirements = await session.scalar(
+        select(OrderRequirementsVersion.content).where(
+            OrderRequirementsVersion.order_id == order_id,
+            OrderRequirementsVersion.status == VersionStatus.CONFIRMED,
+        )
+    )
+    assert requirements is not None
     plan = await session.scalar(
         select(OrderPlanVersion).where(
             OrderPlanVersion.order_id == order_id,
@@ -45,17 +87,25 @@ async def _expected_from_db(session: AsyncSession, order_id: int) -> list[str]:
     )
     texts = {row.section_index: row.content for row in rows}
 
-    lines = [GOST_7_32.toc_title]
+    lines = [*_expected_title_page(requirements), GOST_7_32.toc_title]
+    number = 0
     for index, section in enumerate(plan.content["sections"]):
-        number = index + 1
         content = texts[index]
-        lines.append(f"{number}. {section['title']}")
+        structural = section["title"].casefold() in ("введение", "заключение")
+        if structural:
+            lines.append(section["title"].upper())
+        else:
+            number += 1
+            lines.append(f"{number}. {section['title']}")
         lines += content["paragraphs"]
         planned = section.get("subsections") or []
         pairs = zip(planned, content["subsections"], strict=True)
         for sub_number, (sub, text) in enumerate(pairs, start=1):
-            lines.append(f"{number}.{sub_number}. {sub['title']}")
+            lines.append(sub["title"] if structural else f"{number}.{sub_number}. {sub['title']}")
             lines += text["paragraphs"]
+    for item, reference in enumerate(requirements.get("references") or [], start=1):
+        lines += [REFERENCES_TITLE] if item == 1 else []
+        lines.append(f"{item}. {reference}")
     return lines
 
 
@@ -78,14 +128,21 @@ async def test_headings_match_plan_order(session: AsyncSession) -> None:
 
     data = PracticeReportDocxRenderer().render(await assemble_document(session, order_id))
 
-    headings = [line for line in extract_lines(data) if line[:1].isdigit()]
+    lines = extract_lines(data)
+    headings = [
+        line
+        for line in lines[lines.index(GOST_7_32.toc_title) :]
+        if line[:1].isdigit() or line in ("ВВЕДЕНИЕ", "ЗАКЛЮЧЕНИЕ")
+    ]
+
+    # ГОСТ 7.32 (Stage 3.11): структурные элементы без номера, основные — с 1.
     assert headings == [
-        "1. Введение",
-        "2. Характеристика организации",
-        "2.1. Общие сведения",
-        "2.2. Структура",
-        "3. Анализ бизнес-процессов",
-        "4. Заключение",
+        "ВВЕДЕНИЕ",
+        "1. Характеристика организации",
+        "1.1. Общие сведения",
+        "1.2. Структура",
+        "2. Анализ бизнес-процессов",
+        "ЗАКЛЮЧЕНИЕ",
     ]
 
 
@@ -114,3 +171,18 @@ async def test_rendering_is_read_only_and_repeatable(session: AsyncSession) -> N
         )
     ]
     assert after == before
+
+
+async def test_report_with_references_renders_list_last(session: AsyncSession) -> None:
+    """Stage 3.11: источники из подтверждённого ТЗ — последним разделом без номера."""
+    book = "Иванов И. И. Бизнес-процессы. — М.: Наука, 2020."
+    order_id = await generating_order(session, references=[book, "ГОСТ 7.32-2017."])
+    llm = FakeLLMClient(*ALL_GOOD)
+    for _ in ALL_GOOD:
+        assert (await generate_next_section(session, llm, order_id)).kind is ReportOutcomeKind.SAVED
+
+    data = PracticeReportDocxRenderer().render(await assemble_document(session, order_id))
+
+    lines = extract_lines(data)
+    assert lines == await _expected_from_db(session, order_id)
+    assert lines[-3:] == [REFERENCES_TITLE, f"1. {book}", "2. ГОСТ 7.32-2017."]

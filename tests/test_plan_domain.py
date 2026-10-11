@@ -22,6 +22,7 @@ from app.domain.plan import (
     PLAN_REQUIREMENT_FIELDS,
     InvalidPlanResponse,
     distribute_pages,
+    is_references_title,
     oversized_sections,
     plan_requirements,
     report_pages_supported,
@@ -714,3 +715,39 @@ def test_unsupported_volume_is_not_sent_to_model() -> None:
     assert "unsupported_target_pages" not in sent
     assert "target_pages" not in sent
     assert "150" not in repr(sent)
+
+
+# --- Раздел со списком источников добавляет система (Stage 3.11) ------------------------
+
+
+@pytest.mark.parametrize(
+    ("title", "is_references"),
+    [
+        ("Список использованных источников", True),
+        ("СПИСОК ЛИТЕРАТУРЫ", True),
+        ("Список  использованной литературы", True),
+        ("Библиографический список", True),
+        ("Библиография", True),
+        ("Список сокращений", False),
+        ("Источники финансирования", False),
+        ("Анализ литературы", False),
+        ("Введение", False),
+    ],
+)
+def test_is_references_title(title: str, is_references: bool) -> None:
+    assert is_references_title(title) is is_references
+
+
+def test_plan_with_references_section_is_invalid() -> None:
+    payload = plan_payload(
+        section("Введение", 2), section("Анализ", 5), section("Список литературы", 1)
+    )
+
+    with pytest.raises(InvalidPlanResponse):
+        validate_plan(payload, None)
+
+
+def test_references_not_sent_to_model() -> None:
+    sent = plan_requirements({**REQUIREMENTS, "references": ["Иванов И. И. Учебник."]})
+
+    assert "references" not in sent

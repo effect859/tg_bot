@@ -59,6 +59,7 @@ from app.domain.report_generation import (
     validate_section,
 )
 from app.domain.requirements import AnalysisMaterial, build_analysis_input
+from app.domain.title_page import build_title_page
 from app.generation.schemas import DocumentContent, Section
 from app.llm.base import LLMClient, LLMError, LLMResult, PromptBlock, StopReason
 from app.services.orders import (
@@ -227,10 +228,15 @@ async def assemble_document(session: AsyncSession, order_id: int) -> DocumentCon
                 subsections=subsections,
             )
         )
-    requirements = await _confirmed_requirements(session, order_id)
-    topic = (requirements or {}).get("topic") or ""
+    requirements = await _confirmed_requirements(session, order_id) or {}
+    # Титульный лист и список источников — из подтверждённого ТЗ, без модели: источники
+    # только те, что подтверждены цитатой из материалов (в старых ТЗ их нет).
     return DocumentContent(
-        doc_type=order.doc_type, title=topic, title_page={}, sections=sections, references=[]
+        doc_type=order.doc_type,
+        title=requirements.get("topic") or "",
+        title_page=build_title_page(requirements),
+        sections=sections,
+        references=list(requirements.get("references") or []),
     )
 
 

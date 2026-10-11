@@ -4,7 +4,7 @@ import json
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
-from app.domain.requirements import LLM_FIELDS
+from app.domain.requirements import LLM_FIELDS, LLM_LIST_FIELDS
 from app.llm.base import LLMResult, LLMUsage, PromptBlock, StopReason
 
 Answer = LLMResult | Exception | Callable[[], LLMResult]
@@ -50,18 +50,23 @@ class FakeLLMClient:
 
 
 def response_json(
-    extra_requirements: list[tuple[str, str]] | None = None, **fields: tuple[Any, Any]
+    extra_requirements: list[tuple[str, str]] | None = None,
+    references: list[tuple[str, str]] | None = None,
+    **fields: tuple[Any, Any],
 ) -> str:
     """JSON ответа модели: ``topic=("значение", "цитата")``, остальные поля — null."""
     payload: dict[str, Any] = {
         name: {"value": None, "evidence": None}
         for name in LLM_FIELDS
-        if name != "extra_requirements"
+        if name not in LLM_LIST_FIELDS
     }
     for name, (value, evidence) in fields.items():
         payload[name] = {"value": value, "evidence": evidence}
     payload["extra_requirements"] = [
         {"value": value, "evidence": evidence} for value, evidence in extra_requirements or []
+    ]
+    payload["references"] = [
+        {"value": value, "evidence": evidence} for value, evidence in references or []
     ]
     return json.dumps({"fields": payload}, ensure_ascii=False)
 

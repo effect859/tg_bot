@@ -1222,3 +1222,41 @@ async def test_consent_callback_goes_to_requirements_handler(
 
     assert (await fresh_order(session, order_id)).status is S.PREPARING_PLAN
     assert _texts_sent(bot) == [texts.REQUIREMENTS_CONFIRMED]
+
+
+# --- Список источников в резюме ТЗ (Stage 3.11) -----------------------------------------
+
+
+def test_summary_shows_references_with_count() -> None:
+    content = {**FULL, "references": ["Иванов И. И. Учебник & <практикум>.", "ГОСТ 7.32-2017."]}
+
+    summary = texts.requirements_summary(1, content)
+
+    assert "<b>Список источников (2):</b>" in summary
+    assert "• Иванов И. И. Учебник &amp; &lt;практикум&gt;." in summary
+    assert "• ГОСТ 7.32-2017." in summary
+
+
+def test_summary_without_references_has_no_list() -> None:
+    assert "Список источников" not in texts.requirements_summary(1, FULL)
+
+
+def test_summary_with_most_references_fits_telegram_limit() -> None:
+    worst = {
+        **FULL,
+        "topic": "&" * 500,
+        "practice_type": "<" * 255,
+        "practice_place": ">" * 255,
+        "university": "&" * 255,
+        "student_name": "&" * 255,
+        "specialty": "&" * 255,
+        "student_group": "&" * 255,
+        "supervisor": "&" * 255,
+        "extra_requirements": ["&" * 500] * 20,
+        "references": ["&" * 500] * 30,
+    }
+
+    summary = texts.requirements_summary(10**12, worst)
+
+    assert len(summary) <= texts.MAX_MESSAGE_CHARS
+    assert "Список источников (30)" in summary

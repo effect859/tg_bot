@@ -473,7 +473,9 @@ def test_regular_plan_is_shown_in_full() -> None:
 
     assert texts.PLAN_SHORTENED not in text
     assert "Объём: 25 стр." in text
-    assert "2.1. Общие сведения" in text
+    # Нумерация как в DOCX: «Введение» без номера, основные разделы с 1 (Stage 3.11).
+    assert "<b>Введение</b>" in text
+    assert "1.1. Общие сведения" in text
     assert "• Описать структуру отдела продаж" in text
 
 

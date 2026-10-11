@@ -56,7 +56,10 @@ LLM_FIELDS: tuple[str, ...] = (
     "student_group",
     "target_pages",
     "extra_requirements",
+    "references",
 )
+# Поля-списки: каждый элемент — со своей цитатой из материалов.
+LLM_LIST_FIELDS: tuple[str, ...] = ("extra_requirements", "references")
 # Никогда не запрашиваются у модели.
 NOT_FOR_LLM: frozenset[str] = frozenset({"student_name", "university", "supervisor"})
 
@@ -71,6 +74,10 @@ MIN_EVIDENCE_CHARS = 10
 MAX_EVIDENCE_CHARS = 500
 MAX_EXTRA_REQUIREMENTS = 20
 MAX_EXTRA_REQUIREMENT_CHARS = 500
+# Источники (литература), перечисленные в самих материалах: в отчёт попадает только
+# подтверждённое цитатой — модель источники не придумывает.
+MAX_REFERENCES = 30
+MAX_REFERENCE_CHARS = 500
 MIN_PRACTICE_DATE = date(2000, 1, 1)
 MAX_PRACTICE_DATE = date(2100, 12, 31)
 
@@ -146,6 +153,22 @@ def _nullable(schema: dict[str, Any]) -> dict[str, Any]:
     return {"anyOf": [schema, {"type": "null"}]}
 
 
+def _items(description: str) -> dict[str, Any]:
+    return {
+        "type": "array",
+        "description": description,
+        "items": {
+            "type": "object",
+            "properties": {
+                "value": {"type": "string"},
+                "evidence": {"type": "string"},
+            },
+            "required": ["value", "evidence"],
+            "additionalProperties": False,
+        },
+    }
+
+
 def _field(value_schema: dict[str, Any], description: str) -> dict[str, Any]:
     return {
         "type": "object",
@@ -181,19 +204,11 @@ ANALYSIS_JSON_SCHEMA: dict[str, Any] = {
                     for name in (*LLM_TEXT_FIELDS, *LLM_DATE_FIELDS)
                 },
                 "target_pages": _field({"type": "integer"}, _FIELD_DESCRIPTIONS["target_pages"]),
-                "extra_requirements": {
-                    "type": "array",
-                    "description": "Дополнительные требования к отчёту из материалов.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "value": {"type": "string"},
-                            "evidence": {"type": "string"},
-                        },
-                        "required": ["value", "evidence"],
-                        "additionalProperties": False,
-                    },
-                },
+                "extra_requirements": _items("Дополнительные требования к отчёту из материалов."),
+                "references": _items(
+                    "Источники (литература, нормативные документы), прямо перечисленные в "
+                    "материалах, — каждый дословно, отдельным элементом."
+                ),
             },
             "required": list(LLM_FIELDS),
             "additionalProperties": False,
@@ -263,22 +278,15 @@ def validate_extraction(raw: Any, source_text: str) -> ExtractionResult:
             del accepted[name]
             rejected[name] = "date_order"
 
-    requirements: list[str] = []
-    for item in fields["extra_requirements"]:
-        value = _text(item["value"], MAX_EXTRA_REQUIREMENT_CHARS)
-        if (
-            value is None
-            or not _evidence_found(item["evidence"], source)
-            or not _text_in_evidence(value, normalize_whitespace(item["evidence"]))
-        ):
-            rejected["extra_requirements"] = "some_items_rejected"
-        elif len(requirements) == MAX_EXTRA_REQUIREMENTS:
-            rejected["extra_requirements"] = "too_many_items"
-            break
-        else:
-            requirements.append(value)
-    if requirements:
-        accepted["extra_requirements"] = requirements
+    for name, max_items, max_chars in (
+        ("extra_requirements", MAX_EXTRA_REQUIREMENTS, MAX_EXTRA_REQUIREMENT_CHARS),
+        ("references", MAX_REFERENCES, MAX_REFERENCE_CHARS),
+    ):
+        items, reason = _quoted_items(fields[name], source, max_items, max_chars)
+        if items:
+            accepted[name] = items
+        if reason is not None:
+            rejected[name] = reason
 
     try:
         content = PracticeReportRequirements.model_validate(accepted).model_dump(mode="json")
@@ -298,12 +306,34 @@ def _structure(raw: Any) -> dict[str, Any]:
         entry = fields[name]
         if not isinstance(entry, dict) or "value" not in entry or "evidence" not in entry:
             raise InvalidAnalysisResponse(f"field {name!r} has no value/evidence")
-    items = fields["extra_requirements"]
-    if not isinstance(items, list) or not all(
-        isinstance(i, dict) and "value" in i and "evidence" in i for i in items
-    ):
-        raise InvalidAnalysisResponse("extra_requirements is not a list of value/evidence")
+    for name in LLM_LIST_FIELDS:
+        items = fields[name]
+        if not isinstance(items, list) or not all(
+            isinstance(i, dict) and "value" in i and "evidence" in i for i in items
+        ):
+            raise InvalidAnalysisResponse(f"{name} is not a list of value/evidence")
     return fields
+
+
+def _quoted_items(
+    items: list[dict[str, Any]], source: str, max_items: int, max_chars: int
+) -> tuple[list[str], str | None]:
+    """Элементы списка, каждый подтверждённый своей цитатой; причина отказа части."""
+    accepted: list[str] = []
+    reason: str | None = None
+    for item in items:
+        value = _text(item["value"], max_chars)
+        if (
+            value is None
+            or not _evidence_found(item["evidence"], source)
+            or not _text_in_evidence(value, normalize_whitespace(item["evidence"]))
+        ):
+            reason = "some_items_rejected"
+        elif len(accepted) == max_items:
+            return accepted, "too_many_items"
+        else:
+            accepted.append(value)
+    return accepted, reason
 
 
 def _evidence_found(evidence: Any, source: str) -> bool:

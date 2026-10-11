@@ -12,6 +12,8 @@ from app.domain.report_document import (
     MAX_TITLE_CHARS,
     DocumentErrorCode,
     InvalidDocumentError,
+    heading_numbers,
+    is_structural,
     validate_document_content,
 )
 from app.generation.schemas import DocumentContent, Section
@@ -330,3 +332,30 @@ def test_error_has_code_and_path_but_no_text() -> None:
 
     assert str(error) == "invalid_character at sections[0].paragraphs[0]"
     assert "СЕКРЕТНЫЙ" not in str(error)
+
+
+# --- Нумерация заголовков по ГОСТ 7.32 (Stage 3.11) ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("title", "structural"),
+    [
+        ("Введение", True),
+        ("ВВЕДЕНИЕ", True),
+        ("  заключение  ", True),
+        ("Заключение и выводы", False),
+        ("Вступление", False),
+        ("Список литературы", False),
+        ("Введение.", False),
+    ],
+)
+def test_is_structural(title: str, structural: bool) -> None:
+    assert is_structural(title) is structural
+
+
+def test_heading_numbers_skip_structural_elements() -> None:
+    titles = ["Введение", "Теория", "Практика", "Заключение"]
+
+    assert heading_numbers(titles) == [None, "1", "2", None]
+    assert heading_numbers(["А", "Б"]) == ["1", "2"]
+    assert heading_numbers([]) == []

@@ -37,9 +37,10 @@ async def payment_pending_order(
     plan: LLMResult = REPORT_PLAN,
     target_pages: int | None = TARGET_PAGES,
     material: str | None = None,
+    references: list[str] | None = None,
 ) -> int:
     """Заказ в PAYMENT_PENDING: подтверждённые ТЗ и план, цена зафиксирована (зафиксировано)."""
-    content = {**REQUIREMENTS, "target_pages": target_pages}
+    content = {**REQUIREMENTS, "target_pages": target_pages, "references": references or []}
     kwargs: dict[str, Any] = {"tg_id": tg_id, "content": content}
     if material is not None:
         kwargs["material"] = material
@@ -58,10 +59,16 @@ async def generating_order(
     plan: LLMResult = REPORT_PLAN,
     target_pages: int | None = TARGET_PAGES,
     material: str | None = None,
+    references: list[str] | None = None,
 ) -> int:
     """Заказ в GENERATING: подтверждённые ТЗ и план, оплата пройдена (зафиксировано)."""
     order_id = await payment_pending_order(
-        session, tg_id=tg_id, plan=plan, target_pages=target_pages, material=material
+        session,
+        tg_id=tg_id,
+        plan=plan,
+        target_pages=target_pages,
+        material=material,
+        references=references,
     )
     # Оплата — только списанием кредитов: PAYMENT_PENDING → PAID → GENERATING.
     await pay_for_order(session, order_id)

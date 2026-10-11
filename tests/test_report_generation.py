@@ -21,6 +21,7 @@ from app.db.models import LLMCall, Order, OrderPlanVersion, OrderReportSection
 from app.domain.enums import LLMCallStatus, OrderStatus, VersionStatus
 from app.domain.errors import VersionNotFoundError
 from app.domain.report_generation import MAX_SECTION_PAGES, SECTION_JSON_SCHEMA, ReportOutcomeKind
+from app.domain.title_page import build_title_page
 from app.llm.anthropic import AnthropicLLMClient
 from app.llm.base import LLMPermanentError, LLMTemporaryError, StopReason
 from app.services import orders
@@ -588,7 +589,11 @@ async def test_assemble_document(session: AsyncSession) -> None:
     document = await assemble_document(session, order_id)
 
     assert document.title == "Анализ бизнес-процессов отдела продаж"
-    assert document.title_page == {} and document.references == []
+    # Титульный лист — из подтверждённого ТЗ; источников в этом ТЗ нет (Stage 3.11).
+    assert document.title_page == build_title_page(REQUIREMENTS)
+    assert document.title_page["student_name"] == "Иванов Иван Иванович"
+    assert document.title_page["year"] == "2026"
+    assert document.references == []
     assert [s.title for s in document.sections] == [
         "Введение",
         "Характеристика организации",
@@ -753,3 +758,25 @@ def test_recovery_constants() -> None:
 
 def test_report_plan_sample() -> None:
     assert json.loads(REPORT_PLAN.text)["sections"][1]["title"] == "Характеристика организации"
+
+
+# --- Титульный лист и источники — из ТЗ, без модели (Stage 3.11) -------------------------
+
+BOOK = "Иванов И. И. Бизнес-процессы. — М.: Наука, 2020."
+
+
+async def test_assemble_document_takes_references_from_requirements(
+    session: AsyncSession,
+) -> None:
+    order_id = await generating_order(session, references=[BOOK])
+    llm = await _generate_all(session, order_id)
+
+    document = await assemble_document(session, order_id)
+
+    assert document.references == [BOOK]
+    # Источники и данные титульного листа модели не передаются.
+    for call in llm.calls:
+        request = repr(call)
+        assert BOOK not in request
+        for value in PERSONAL_VALUES:
+            assert value not in request

@@ -197,7 +197,7 @@ async def test_numbered_titles_saved_without_numbers_and_without_retry(
 async def test_plan_view_of_numbered_response_has_no_double_numbers(
     session: AsyncSession,
 ) -> None:
-    """Регрессия M1: пользователь видит «1. Введение», а не «1. 1. Введение»."""
+    """Регрессия M1: номер из ответа модели не дублируется («1. 1. Основная часть»)."""
     order_id = await preparing_order(session)
     # Сумма 25 — объём ТЗ FULL; каждый раздел не больше MAX_SECTION_PAGES (8).
     numbered = plan_result(
@@ -212,10 +212,17 @@ async def test_plan_view_of_numbered_response_has_no_double_numbers(
 
     view = texts.plan_view(order_id, plan.content)
 
-    lines = ("1. Введение", "2. Основная часть", "2.1. Сведения", "3. Анализ", "4. Заключение")
+    # Нумерация как в DOCX (Stage 3.11): «Введение» и «Заключение» без номера.
+    lines = (
+        "<b>Введение</b>",
+        "1. Основная часть",
+        "1.1. Сведения",
+        "2. Анализ",
+        "<b>Заключение</b>",
+    )
     for line in lines:
         assert line in view
-    for doubled in ("1. 1.", "2. 2.", "2.1. 2.1.", "3. 3.", "4. 4."):
+    for doubled in ("1. 1.", "2. 2.", "1.1. 1.1.", "1. Введение", "4. Заключение"):
         assert doubled not in view
 
 
@@ -947,3 +954,27 @@ async def test_supported_target_bounds_still_plan(
     assert len(llm.calls) == 1
     [saved] = await _plans(session, order_id)
     assert saved.content["total_pages"] == pages
+
+
+async def test_references_section_in_plan_is_retried(session: AsyncSession) -> None:
+    """Stage 3.11: список источников добавляет система — такой план повторяется."""
+    order_id = await preparing_order(session)
+    with_references = plan_result(
+        section("Введение", 3),
+        section("Анализ", 8),
+        section("Выводы", 8),
+        section("Список использованных источников", 6),
+    )
+    llm = FakeLLMClient(with_references, GOOD_PLAN)
+
+    first = await generate_plan(session, llm, order_id)
+    second = await generate_plan(session, llm, order_id)
+
+    assert (first.kind, first.error_code) == (K.RETRY_LATER, "invalid_response")
+    assert second.kind is K.COMPLETED
+
+
+def test_prompt_forbids_references_section() -> None:
+    prompt = " ".join(service.PLAN_PROMPT.split())
+
+    assert "Не включай в план раздел со списком литературы или источников" in prompt

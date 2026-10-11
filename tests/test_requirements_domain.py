@@ -10,6 +10,8 @@ from app.domain.requirements import (
     LLM_FIELDS,
     MAX_ANALYSIS_INPUT_CHARS,
     MAX_EXTRA_REQUIREMENTS,
+    MAX_REFERENCE_CHARS,
+    MAX_REFERENCES,
     MIN_EVIDENCE_CHARS,
     NOT_FOR_LLM,
     REQUIRED_FIELDS,
@@ -443,3 +445,82 @@ def test_page_count_longer_than_evidence_limit_cannot_be_quoted() -> None:
 
     assert result.content["target_pages"] is None
     assert result.rejected == {"target_pages": "evidence_not_found"}
+
+
+# --- Источники из материалов (Stage 3.11) ---------------------------------------------
+# В список источников попадает только то, что дословно стоит в материалах.
+
+BOOK = "Иванов И. И. Бизнес-процессы. — М.: Наука, 2020. — 200 с."
+LAW = "ГОСТ 7.32-2017. Отчёт о научно-исследовательской работе."
+REFERENCES_SOURCE = f"{SOURCE}\nРекомендуемая литература:\n1. {BOOK}\n2. {LAW}"
+
+
+def _references(*items: tuple[str, str], source: str = REFERENCES_SOURCE) -> Any:
+    return validate_extraction(json.loads(response_json(references=list(items))), source)
+
+
+def test_references_with_evidence_are_accepted() -> None:
+    result = _references((BOOK, f"1. {BOOK}"), (LAW, LAW))
+
+    assert result.content["references"] == [BOOK, LAW]
+    assert result.rejected == {}
+    assert "references" in result.found
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        (
+            "Петров П. П. Выдуманная книга. — М., 2021.",
+            "Петров П. П. Выдуманная книга. — М., 2021.",
+        ),
+        (BOOK, "Другая цитата, которой нет в материалах."),
+        ("Иванов И. И. Бизнес-процессы. — СПб., 2020.", f"1. {BOOK}"),
+        ("", f"1. {BOOK}"),
+    ],
+    ids=["not-in-materials", "quote-not-found", "value-not-in-quote", "empty"],
+)
+def test_unconfirmed_reference_is_rejected(item: tuple[str, str]) -> None:
+    result = _references(item, (LAW, LAW))
+
+    assert result.content["references"] == [LAW]
+    assert result.rejected == {"references": "some_items_rejected"}
+
+
+def test_references_limit() -> None:
+    items = [f"Источник номер {i:02d}. — М., 2020." for i in range(MAX_REFERENCES + 1)]
+    source = SOURCE + "\n" + "\n".join(items)
+
+    result = _references(*((item, item) for item in items), source=source)
+
+    assert result.content["references"] == items[:MAX_REFERENCES]
+    assert result.rejected == {"references": "too_many_items"}
+
+
+def test_reference_too_long_is_rejected() -> None:
+    long_item = "Источник " + "а" * MAX_REFERENCE_CHARS
+    source = f"{SOURCE}\n{long_item}"
+
+    result = _references((long_item, long_item[:500]), source=source)
+
+    assert result.content["references"] == []
+    assert result.rejected == {"references": "some_items_rejected"}
+
+
+def test_no_references_is_empty_list() -> None:
+    assert _references().content["references"] == []
+
+
+def test_schema_asks_for_references_from_materials_only() -> None:
+    properties = ANALYSIS_JSON_SCHEMA["properties"]["fields"]["properties"]
+
+    assert properties["references"]["type"] == "array"
+    assert "references" in ANALYSIS_JSON_SCHEMA["properties"]["fields"]["required"]
+
+
+def test_old_requirements_without_references_validate() -> None:
+    old = {"topic": "Тема", "target_pages": 25}
+
+    content = PracticeReportRequirements.model_validate(old).model_dump(mode="json")
+
+    assert content["references"] == []

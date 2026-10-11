@@ -24,6 +24,7 @@ from app.domain.materials import (
     MaterialCompletionState,
 )
 from app.domain.plan import MAX_REPORT_PAGES, MIN_REPORT_PAGES, unsupported_volume
+from app.domain.report_document import heading_numbers
 from app.domain.requirements import MAX_ANALYSIS_INPUT_CHARS, REQUIRED_FIELDS
 from app.domain.requirements_dialog import TEXT_ANSWER_LIMITS, AnswerError
 from app.extraction.base import WarningCode
@@ -189,6 +190,7 @@ REQUIREMENT_LABELS: dict[str, str] = {
     "supervisor": "руководитель практики",
     "target_pages": "объём отчёта",
     "extra_requirements": "дополнительные требования",
+    "references": "список источников",
 }
 ANALYSIS_STARTED = "🔎 Анализирую материалы — это может занять пару минут."
 ANALYSIS_DELAYED = (
@@ -626,10 +628,14 @@ def _render_plan(
     if isinstance(total, int):
         lines.append(f"Объём: {total} стр.")
     sections = plan.get("sections")
-    for number, section in enumerate(sections if isinstance(sections, list) else [], start=1):
+    sections = sections if isinstance(sections, list) else []
+    # Нумерация как в документе: «Введение» и «Заключение» без номера.
+    numbers = heading_numbers([str(section.get("title", "")) for section in sections])
+    for number, section in zip(numbers, sections, strict=True):
+        prefix = "" if number is None else f"{number}. "
         lines.append("")
         lines.append(
-            f"<b>{number}. {_preview(str(section.get('title', '')), title_len)}</b>"
+            f"<b>{prefix}{_preview(str(section.get('title', '')), title_len)}</b>"
             f"{_pages_suffix(section.get('target_pages'))}"
         )
         description = str(section.get("description") or "")
@@ -640,8 +646,9 @@ def _render_plan(
             lines += [f"• {_preview(str(item), req_len)}" for item in requirements[:max_reqs]]
         subsections = section.get("subsections") or []
         for sub_number, sub in enumerate(subsections[:max_subs], start=1):
+            sub_prefix = "" if number is None else f"{number}.{sub_number}. "
             lines.append(
-                f"   {number}.{sub_number}. {_preview(str(sub.get('title', '')), sub_len)}"
+                f"   {sub_prefix}{_preview(str(sub.get('title', '')), sub_len)}"
                 f"{_pages_suffix(sub.get('target_pages'))}"
             )
         if len(subsections) > max_subs:
@@ -687,25 +694,29 @@ def _render_summary(
         # target_pages) показывается один раз — в предупреждении ниже.
         and not (name == "target_pages" and volume is not None)
     ]
-    raw_extra = content.get("extra_requirements")
-    extra = (
-        [item for item in raw_extra if isinstance(item, str)] if isinstance(raw_extra, list) else []
-    )
-    if optional or extra:
+    lists = [(name, _strings(content.get(name))) for name in ("extra_requirements", "references")]
+    if optional or any(items for _, items in lists):
         lines += ["", "<i>Найдено в материалах:</i>"]
         for name in optional:
             shown = _field_value(name, content.get(name), value_limit)
             lines.append(f"<b>{field_label(name)}:</b> {shown}")
-        if extra:
-            lines.append(f"<b>{field_label('extra_requirements')}:</b>")
-            lines += [f"• {_preview(item, value_limit)}" for item in extra[:max_items]]
-            if len(extra) > max_items:
-                lines.append(f"…и ещё {len(extra) - max_items}")
+        for name, items in lists:
+            if not items:
+                continue
+            count = f" ({len(items)})" if name == "references" else ""
+            lines.append(f"<b>{field_label(name)}{count}:</b>")
+            lines += [f"• {_preview(item, value_limit)}" for item in items[:max_items]]
+            if len(items) > max_items:
+                lines.append(f"…и ещё {len(items) - max_items}")
     if volume is None:
         lines += ["", REQUIREMENTS_CONFIRM_PROMPT]
     else:
         lines += ["", volume_unsupported_warning(volume), "", REQUIREMENTS_VOLUME_PROMPT]
     return "\n".join(lines)
+
+
+def _strings(value: object) -> list[str]:
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
 
 
 def volume_unsupported_warning(pages: int) -> str:

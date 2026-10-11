@@ -224,6 +224,23 @@ async def test_volume_from_materials_is_kept_supported_or_not(
     assert draft.content["unsupported_target_pages"] == unsupported
 
 
+async def test_references_from_materials_are_saved_in_draft(session: AsyncSession) -> None:
+    """Stage 3.11: источники — только с цитатой из материалов; выдуманный не сохраняется."""
+    book = "Иванов И. И. Бизнес-процессы. — М.: Наука, 2020."
+    order_id = await _order(session, f"{MATERIAL}\nЛитература: {book}")
+    response = response_json(
+        references=[(book, f"Литература: {book}"), ("Выдуманный источник, 2024.", "нет такого")]
+    )
+
+    outcome = await analyze_requirements(session, FakeLLMClient(result(response)), order_id)
+
+    assert outcome.kind is K.COMPLETED
+    [draft] = await _versions(session, order_id)
+    assert draft.content["references"] == [book]
+    prompt = " ".join(analysis.SYSTEM_PROMPT.split())
+    assert "Не добавляй источники, которых в материалах нет" in prompt
+
+
 async def test_oversized_materials_are_truncated_explicitly(session: AsyncSession) -> None:
     first = "А" * 300_000
     second = MATERIAL + " " + "Б" * 200_000  # не помещается целиком
