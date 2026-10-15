@@ -169,6 +169,35 @@ async def test_cache_usage_mapping(
     assert (result.usage.cached_tokens, result.usage.cache_creation_tokens) == expected
 
 
+async def test_pricing_fields_mapping() -> None:
+    """Для стоимости: разбивка записи в кэш по сроку, тариф и регион (Stage 3.12)."""
+    message = _usage_message(cache_read=300, cache_creation=1200)
+    message["usage"]["cache_creation"] = {
+        "ephemeral_5m_input_tokens": 200,
+        "ephemeral_1h_input_tokens": 1000,
+    }
+    message["usage"]["service_tier"] = "standard"
+    message["usage"]["inference_geo"] = "global"
+    transport = Transport(httpx2.Response(200, json=message))
+
+    usage = (await _complete(_client(transport))).usage
+
+    assert (usage.cache_write_5m_tokens, usage.cache_write_1h_tokens) == (200, 1000)
+    assert (usage.service_tier, usage.inference_geo) == ("standard", "global")
+
+
+async def test_pricing_fields_absent_stay_unknown() -> None:
+    """Провайдер не сообщил разбивку — None, а не 0: тариф записи неизвестен."""
+    transport = Transport(
+        httpx2.Response(200, json=_usage_message(cache_read=0, cache_creation=1200))
+    )
+
+    usage = (await _complete(_client(transport))).usage
+
+    assert (usage.cache_write_5m_tokens, usage.cache_write_1h_tokens) == (None, None)
+    assert (usage.service_tier, usage.inference_geo) == (None, None)
+
+
 @pytest.mark.parametrize(
     ("stop_reason", "expected"),
     [

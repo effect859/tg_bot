@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import anthropic
 import httpx2
@@ -34,7 +35,7 @@ from app.domain.plan import (
     PlanOutcomeKind,
 )
 from app.llm.anthropic import AnthropicLLMClient
-from app.llm.base import LLMPermanentError, LLMTemporaryError, StopReason
+from app.llm.base import LLMPermanentError, LLMTemporaryError, LLMUsage, StopReason
 from app.services import orders
 from app.services import plan_generation as service
 from app.services.plan_generation import (
@@ -46,7 +47,7 @@ from app.services.plan_generation import (
     run_plan_pass,
 )
 from dialog_samples import FULL
-from fake_llm import FakeLLMClient, result
+from fake_llm import PRICED_MODEL, FakeLLMClient, priced, result
 from plan_samples import (
     GOOD_PLAN,
     MATERIAL,
@@ -978,3 +979,49 @@ def test_prompt_forbids_references_section() -> None:
     prompt = " ".join(service.PLAN_PROMPT.split())
 
     assert "Не включай в план раздел со списком литературы или источников" in prompt
+
+
+# --- Стоимость вызова (Stage 3.12) ----------------------------------------------------
+
+PRICED_USAGE = LLMUsage(
+    input_tokens=1000,
+    output_tokens=500,
+    cached_tokens=2000,
+    cache_creation_tokens=3000,
+    cache_write_5m_tokens=1000,
+    cache_write_1h_tokens=2000,
+)
+# 1000·2 + 500·10 + 2000·0,10 + 1000·2,50 + 2000·4 = 17 700 (USD·10⁻⁶).
+PRICED_COST = Decimal("0.017700")
+
+
+async def test_call_cost_and_cache_write_recorded(session: AsyncSession) -> None:
+    order_id = await preparing_order(session)
+
+    await generate_plan(session, FakeLLMClient(priced(GOOD_PLAN, PRICED_USAGE)), order_id)
+
+    [call] = await _calls(session, order_id)
+    assert call.model == PRICED_MODEL
+    assert (call.cached_tokens, call.cache_creation_tokens) == (2000, 3000)
+    assert call.cost_usd == PRICED_COST
+
+
+async def test_unknown_model_cost_is_null(session: AsyncSession) -> None:
+    order_id = await preparing_order(session)
+
+    await generate_plan(session, FakeLLMClient(GOOD_PLAN), order_id)
+
+    [call] = await _calls(session, order_id)
+    assert call.model == "fake-model-2026"
+    assert call.cost_usd is None  # NULL, а не 0
+
+
+async def test_call_without_response_has_no_cost(session: AsyncSession) -> None:
+    """Ответа нет — usage неизвестен: стоимость NULL, хотя провайдер мог вызов оплатить."""
+    order_id = await preparing_order(session)
+
+    await generate_plan(session, FakeLLMClient(LLMTemporaryError("timeout")), order_id)
+
+    [call] = await _calls(session, order_id)
+    assert (call.status, call.error) == (LLMCallStatus.ERROR, "timeout")
+    assert (call.input_tokens, call.output_tokens, call.cost_usd) == (0, 0, None)

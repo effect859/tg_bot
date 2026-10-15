@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import anthropic
@@ -23,7 +24,7 @@ from app.domain.errors import VersionNotFoundError
 from app.domain.report_generation import MAX_SECTION_PAGES, SECTION_JSON_SCHEMA, ReportOutcomeKind
 from app.domain.title_page import build_title_page
 from app.llm.anthropic import AnthropicLLMClient
-from app.llm.base import LLMPermanentError, LLMTemporaryError, StopReason
+from app.llm.base import LLMPermanentError, LLMTemporaryError, LLMUsage, StopReason
 from app.services import orders
 from app.services import report_generation as service
 from app.services.plan_generation import generate_plan
@@ -36,7 +37,7 @@ from app.services.report_generation import (
     run_generation_pass,
 )
 from billing_samples import pay_for_order
-from fake_llm import FakeLLMClient, result
+from fake_llm import PRICED_MODEL, FakeLLMClient, priced, result
 from plan_samples import PERSONAL_VALUES, REQUIREMENTS, plan_result, preparing_order, section
 from report_samples import (
     ALL_GOOD,
@@ -780,3 +781,61 @@ async def test_assemble_document_takes_references_from_requirements(
         assert BOOK not in request
         for value in PERSONAL_VALUES:
             assert value not in request
+
+
+# --- Стоимость вызова (Stage 3.12) ----------------------------------------------------
+
+PRICED_USAGE = LLMUsage(
+    input_tokens=1000,
+    output_tokens=500,
+    cached_tokens=2000,
+    cache_creation_tokens=3000,
+    cache_write_5m_tokens=1000,
+    cache_write_1h_tokens=2000,
+)
+# 1000·2 + 500·10 + 2000·0,10 + 1000·2,50 + 2000·4 = 17 700 (USD·10⁻⁶).
+PRICED_COST = Decimal("0.017700")
+
+
+async def test_call_cost_recorded(session: AsyncSession) -> None:
+    order_id = await generating_order(session)
+
+    await generate_next_section(session, FakeLLMClient(priced(good(0), PRICED_USAGE)), order_id)
+
+    [call] = await _calls(session, order_id)
+    assert call.model == PRICED_MODEL
+    assert (call.cached_tokens, call.cache_creation_tokens) == (2000, 3000)
+    assert call.cost_usd == PRICED_COST
+
+
+async def test_cache_write_without_ttl_breakdown_cost_is_null(session: AsyncSession) -> None:
+    """Запись в кэш без разбивки по сроку хранения: тариф неизвестен — NULL (OD-6)."""
+    order_id = await generating_order(session)
+    usage = LLMUsage(input_tokens=1000, output_tokens=800, cache_creation_tokens=5000)
+
+    await generate_next_section(session, FakeLLMClient(priced(good(0), usage)), order_id)
+
+    [call] = await _calls(session, order_id)
+    assert call.cache_creation_tokens == 5000
+    assert call.cost_usd is None
+
+
+async def test_call_without_response_has_no_cost(session: AsyncSession) -> None:
+    order_id = await generating_order(session)
+
+    await generate_next_section(session, FakeLLMClient(LLMTemporaryError("timeout")), order_id)
+
+    [call] = await _calls(session, order_id)
+    assert (call.status, call.error) == (LLMCallStatus.ERROR, "timeout")
+    assert (call.input_tokens, call.output_tokens, call.cost_usd) == (0, 0, None)
+
+
+async def test_each_attempt_has_its_own_cost(session: AsyncSession) -> None:
+    """Регенерация по объёму — отдельный вызов со своей стоимостью (не суммируется)."""
+    order_id = await generating_order(session)
+    llm = FakeLLMClient(priced(too_short(0), PRICED_USAGE), priced(good(0), PRICED_USAGE))
+
+    await generate_next_section(session, llm, order_id)
+
+    calls = await _calls(session, order_id)
+    assert [call.cost_usd for call in calls] == [PRICED_COST, PRICED_COST]

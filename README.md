@@ -652,6 +652,7 @@ Telegram и хранилища: `assemble_document()` (Stage 3.1) → `DocumentC
 src/app/
 ├── config.py            # настройки из .env
 ├── main_bot.py          # точка входа бота
+├── admin_credits.py     # консоль оператора: ручная корректировка баланса
 ├── bot/                 # Telegram-слой: хендлеры, клавиатуры, middleware, тексты
 ├── domain/enums.py      # доменные перечисления
 ├── db/                  # модели SQLAlchemy, сессии, классификация ошибок БД
@@ -667,7 +668,7 @@ src/app/
 │   ├── order_refunds.py # возврат кредитов за сбой генерации после оплаты
 │   ├── payments/        # интерфейс платёжного шлюза + Telegram Stars
 │   └── storage/         # интерфейс файлового хранилища + локальная реализация
-├── llm/                 # интерфейс LLM-клиента и реализация для Anthropic
+├── llm/                 # LLM-клиент: интерфейс, Anthropic, стоимость вызова
 ├── generation/          # контракт DocumentContent + интерфейс генератора
 └── rendering/           # интерфейс рендерера (DocumentContent → файл) + DOCX отчёта
 ```
@@ -737,3 +738,176 @@ src/app/
   отменяется (только `logger.error`). Повтор генерации после сбоя не предусмотрен.
 - **Не реализовано.** Возврат Stars (`refundStarPayment`) и ручной разбор отвергнутых
   подтверждений (о них — `logger.error` с номером платежа).
+
+## Ручная корректировка баланса
+
+Консольная команда оператора (`app/admin_credits.py`, сервис —
+`services/billing.admin_adjust`). В Telegram её нет: начислить кредиты из бота нельзя.
+Для пробного прогона она заменяет покупку кредитов за Stars; реальную оплату Stars
+она не проверяет.
+
+```bash
+python -m app.admin_credits show --tg-id N                # баланс, проводки, активный заказ
+python -m app.admin_credits adjust --tg-id N --credits M  # предпросмотр и код подтверждения
+ADMIN_CREDITS_ENABLED=1 python -m app.admin_credits adjust --tg-id N --credits M --confirm CODE
+```
+
+В контейнере production-стека: `docker compose -p <проект> -f docker-compose.prod.yml
+--env-file <env> run --rm --no-deps -e ADMIN_CREDITS_ENABLED=1 bot python -m
+app.admin_credits ...`. `--no-deps` не даёт `run` поднимать зависимости сервиса `bot`,
+в том числе одноразовый `migrate`, поэтому стек (`postgres`) должен быть уже запущен
+через `up -d`.
+
+- **Окружение.** Локальному запуску (не в контейнере) нужны `BOT_TOKEN` и
+  `DATABASE_URL` в переменных окружения процесса или в `.env` в текущем каталоге.
+  `BOT_TOKEN` обязателен для загрузки настроек, хотя Telegram команда не вызывает.
+  Без `DATABASE_URL` берётся значение по умолчанию из `app/config.py` — локальная БД
+  разработки, а не нужная. В контейнере значения задаются не вручную: их собирает
+  `docker-compose.prod.yml` из env-файла, переданного через `--env-file` (тот же, что
+  у бота этого стека, вне репозитория), включая `DATABASE_URL` с хостом `postgres`.
+
+- **Транзакция.** Блокировка строки пользователя (тот же порядок, что у оплаты:
+  платёж → пользователь → заказ; заказ не блокируется), проводка `ADMIN_ADJUST` и
+  `users.balance` — один commit. Сумма — целое, не 0, по модулю не больше 10 000;
+  отрицательная — списание; итоговый баланс меньше 0 — отказ. Пользователь должен
+  существовать (сначала `/start`), команда его не создаёт. Причина корректировки не
+  хранится (колонки нет).
+- **Код подтверждения.** Предпросмотр ничего не меняет и выдаёт код, привязанный к
+  пользователю, сумме, балансу и последней проводке. Выполнение пересчитывает код под
+  блокировкой: после любой проводки (в том числе этой же корректировки) он устаревает,
+  поэтому случайный повтор той же команды отклоняется. Это не идемпотентность: новый
+  предпросмотр даёт новый код и позволяет сознательно повторить операцию. Ключа
+  операции в БД нет.
+- **`ADMIN_CREDITS_ENABLED=1`** — предохранитель от случайного выполнения, а не
+  авторизация: выставить его может любой, у кого есть доступ к серверу. В
+  `docker-compose.prod.yml` переменной нет — её передают только на один запуск.
+  Предпросмотр и `show` работают без неё.
+- **Коды выхода:** 0 — успех или предпросмотр, 1 — схема БД не совпадает с
+  миграциями, 2 — пользователь не найден, 3 — нет предохранителя, 4 — код не совпал,
+  5 — сумма недопустима или баланс стал бы отрицательным. В лог — `user_id`, сумма и
+  номер проводки, без Telegram id.
+
+## Себестоимость и пробный прогон
+
+**Стоимость вызова** (`app/llm/pricing.py`) пишется в `llm_calls.cost_usd` для каждого
+вызова с ответом: анализ материалов, план и генерация текста — отдельные строки со
+своим `step`; повторы и регенерации — тоже отдельные строки. Тарифы
+`claude-sonnet-5-5`, USD за 1 млн токенов (страница цен Anthropic, проверено
+2026-10-11): вход 2, выход 10 (размышления модели входят в выход), запись в кэш на
+5 минут 2,50, на 1 час 4, чтение из кэша 0,10; `inference_geo = us` — ×1,1.
+`input_tokens` — только некэшированный остаток, чтение и запись в кэш — отдельные
+поля по своим тарифам: двойного учёта нет. Каждый вызов с ответом пишет в лог строку
+`LLM call usage` с числами (без текста запроса и ответа).
+
+**NULL, а не 0**, если стоимость нельзя посчитать достоверно: модель не из таблицы
+(ищется точный идентификатор из ответа), запись в кэш без разбивки по сроку хранения
+или разбивка не сходится с суммой, тариф не `standard`, регион не `global`/`us`,
+некорректные числа. Вызов без ответа (тайм-аут, обрыв) — тоже NULL, хотя Anthropic
+мог его оплатить. Поэтому сумма `cost_usd` — **нижняя граница** расходов; источник
+истины — консоль Anthropic (отдельный ключ и workspace для прогона).
+
+**Запросы** — только чтение (`psql`, переменная `:order_id`):
+
+```sql
+-- 1. Стоимость заказа по шагам; unknown_cost — вызовы без известной стоимости.
+SELECT step, count(*) AS calls,
+       count(*) FILTER (WHERE status = 'success') AS ok,
+       count(*) FILTER (WHERE cost_usd IS NULL) AS unknown_cost,
+       sum(cost_usd) AS known_cost_usd,
+       sum(input_tokens) AS input, sum(output_tokens) AS output,
+       sum(cached_tokens) AS cache_read, sum(cache_creation_tokens) AS cache_write
+FROM llm_calls WHERE order_id = :order_id
+GROUP BY step ORDER BY min(id);
+
+-- 2. Стоимость запланированной страницы (total_pages плана — не страницы в Word).
+--    Есть вызовы с неизвестной стоимостью — это нижняя граница.
+SELECT p.content ->> 'total_pages' AS planned_pages,
+       c.known_cost_usd, c.unknown_cost,
+       round(c.known_cost_usd / nullif((p.content ->> 'total_pages')::numeric, 0), 6)
+           AS known_cost_per_page_usd
+FROM (SELECT content FROM order_plan_versions
+      WHERE order_id = :order_id AND status = 'confirmed'
+      ORDER BY version DESC LIMIT 1) AS p,
+     (SELECT sum(cost_usd) AS known_cost_usd,
+             count(*) FILTER (WHERE cost_usd IS NULL) AS unknown_cost
+      FROM llm_calls WHERE order_id = :order_id) AS c;
+
+-- 3. Кэш генерации: доля чтения от полного входа и последовательность вызовов.
+SELECT round(sum(cached_tokens)::numeric
+             / nullif(sum(input_tokens + cached_tokens + cache_creation_tokens), 0), 4)
+           AS cache_read_share
+FROM llm_calls
+WHERE order_id = :order_id AND step = 'report_generation' AND status = 'success';
+
+SELECT id, created_at, status, error, input_tokens, cached_tokens,
+       cache_creation_tokens, output_tokens, latency_ms, cost_usd
+FROM llm_calls WHERE order_id = :order_id AND step = 'report_generation' ORDER BY id;
+
+-- 4. Время: оплата → готово → доставлено; самый долгий успешный вызов генерации.
+SELECT charge.created_at AS paid_at, o.completed_at,
+       o.completed_at - charge.created_at AS generation_time,
+       d.delivered_at - o.completed_at AS delivery_delay,
+       (SELECT max(latency_ms) FROM llm_calls
+        WHERE order_id = o.id AND step = 'report_generation' AND status = 'success')
+           AS max_section_latency_ms
+FROM orders AS o
+JOIN balance_transactions AS charge
+  ON charge.order_id = o.id AND charge.reason = 'order_charge'
+LEFT JOIN order_report_files AS f ON f.order_id = o.id
+LEFT JOIN order_report_deliveries AS d ON d.report_file_id = f.id
+WHERE o.id = :order_id;
+
+-- 5. Ошибки и повторы по шагам.
+SELECT step, status, error, count(*)
+FROM llm_calls WHERE order_id = :order_id
+GROUP BY step, status, error ORDER BY step, status, error;
+
+-- 6. Знаков материалов на токен (для прогноза): первый успешный вызов анализа.
+SELECT (SELECT sum(t.char_count) FROM order_material_texts AS t
+        JOIN order_materials AS m ON m.id = t.material_id
+        WHERE m.order_id = :order_id) AS material_chars,
+       c.input_tokens + c.cached_tokens + c.cache_creation_tokens AS analysis_input_tokens
+FROM llm_calls AS c
+WHERE c.order_id = :order_id AND c.step = 'requirements_analysis' AND c.status = 'success'
+ORDER BY c.id LIMIT 1;
+```
+
+Вызов не связан с номером раздела (такой колонки нет): самый долгий раздел — по
+`max(latency_ms)`, без номера. Вызовы с `order_id IS NULL` ни одному заказу не
+приписываются. Регенерация по объёму и повтор после ошибки в БД неразличимы — это
+просто отдельные строки.
+
+**Пробный прогон** (часть B Stage 3.12 — только по отдельному разрешению):
+
+- **Изоляция.** Отдельный тестовый бот, отдельный env-файл вне репозитория,
+  отдельный ключ Anthropic в отдельном workspace с лимитом расходов (при достижении
+  лимита API отвечает 400 — бот считает это постоянной ошибкой, заказ уходит в
+  `FAILED` с возвратом кредитов). Стек — с отдельным именем проекта:
+  `docker compose -p tg-bot-trial -f docker-compose.prod.yml --env-file <env> up -d
+  --build` (в compose-файле `name: tg-bot`; без `-p` данные прогона попадут в тома
+  будущего production на этой машине). До запуска: `docker compose -p tg-bot-trial
+  ... config` — тома `tg-bot-trial_*`, портов наружу нет.
+- **Кредиты — до подтверждения плана.** Кнопка «Оплатить N кредитов» только
+  списывает кредиты (`pay_order`), счёт Stars она не создаёт. Счёт Stars появляется
+  только из «Баланс» → пакет или из кнопки «Пополнить», которую сообщение об оплате
+  показывает при нехватке кредитов (кнопка выбирается в момент отправки сообщения).
+  Поэтому кредиты начисляются командой выше до подтверждения плана; если сообщение
+  всё же пришло с «Пополнить» — не нажимать, отправить `/start`. Во время прогона не
+  открывать «Баланс» → пакеты. Неудачный заказ возвращает кредиты автоматически.
+- **Остановка после каждого заказа.** Сверить сумму `cost_usd` с консолью Anthropic
+  (расхождение не больше 10%, иначе разобраться), выполнить запросы 1–6, открыть DOCX
+  в Word (обновить поля; страницы всего и без титульного листа и оглавления против
+  `total_pages`; знаки с пробелами). Следующий заказ — только с разрешения владельца
+  и если `потрачено (по консоли) + прогноз × 1,5 + резерв $3 ≤ бюджета`; прогноз — по
+  измеренной стоимости анализа и плана и стоимости страницы генерации, вызовы с
+  неизвестной стоимостью — по максимуму (вход последнего успешного вызова шага +
+  16 000 токенов выхода). Перед «Оплатить» — потолок генерации по формуле ниже с
+  числом разделов N из подтверждённого плана.
+- **Сценарный потолок заказа** (не гарантия: зависит от ρ — знаков на токен,
+  измеряется запросом 6): `15 · (T_m · 2 + 16 000 · 10) / 10⁶ + 3N · ((T_m + T_W) · 4
+  + 16 000 · 10) / 10⁶` USD, где 15 — лимиты вызовов анализа (9) и плана (6), 3N —
+  бюджет вызовов генерации, T_m — токены материалов и промптов, T_W — токены текста
+  отчёта (не больше страниц × 1800 × 1,25 знаков / ρ), 16 000 — `max_tokens`. Худший
+  случай: кэш ни разу не сработал, весь вход оплачен как запись в кэш на 1 час.
+- **Итог** — в USD (как в БД) и в рублях по официальному курсу ЦБ РФ на дату
+  прогона (курс и дата — отдельно), с числом вызовов неизвестной стоимости.

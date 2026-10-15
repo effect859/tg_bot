@@ -93,6 +93,8 @@ class AnthropicLLMClient:
 
         text = "".join(block.text for block in response.content if block.type == "text")
         usage = response.usage
+        # Разбивка записи в кэш по сроку хранения; нет её — тариф записи неизвестен.
+        writes = usage.cache_creation
         return LLMResult(
             text=text,
             model=response.model,
@@ -101,6 +103,10 @@ class AnthropicLLMClient:
                 output_tokens=usage.output_tokens,
                 cached_tokens=usage.cache_read_input_tokens or 0,
                 cache_creation_tokens=usage.cache_creation_input_tokens or 0,
+                cache_write_5m_tokens=writes.ephemeral_5m_input_tokens if writes else None,
+                cache_write_1h_tokens=writes.ephemeral_1h_input_tokens if writes else None,
+                service_tier=usage.service_tier,
+                inference_geo=usage.inference_geo,
             ),
             latency_ms=int((time.monotonic() - started) * 1000),
             stop_reason=_STOP_REASONS.get(response.stop_reason or "", StopReason.OTHER),

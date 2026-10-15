@@ -62,6 +62,7 @@ from app.domain.requirements import AnalysisMaterial, build_analysis_input
 from app.domain.title_page import build_title_page
 from app.generation.schemas import DocumentContent, Section
 from app.llm.base import LLMClient, LLMError, LLMResult, PromptBlock, StopReason
+from app.llm.pricing import cost_usd, log_call_usage
 from app.services.orders import (
     change_status,
     get_plan_versions,
@@ -448,7 +449,10 @@ async def _record_call(session: AsyncSession, call_id: int, attempt: _Attempt) -
         call.output_tokens = result.usage.output_tokens
         call.cached_tokens = result.usage.cached_tokens
         call.cache_creation_tokens = result.usage.cache_creation_tokens
+        # None — стоимость не посчитать достоверно (NULL, а не 0).
+        call.cost_usd = cost_usd(result.model, result.usage)
         call.latency_ms = result.latency_ms
+        log_call_usage(LLM_STEP, call_id, result.model, result.usage)
     if attempt.failure is None:
         call.status, call.error = LLMCallStatus.SUCCESS, None
     else:

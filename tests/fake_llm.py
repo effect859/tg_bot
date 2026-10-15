@@ -1,5 +1,6 @@
 """Подмена LLMClient для тестов: заданные ответы, без сети."""
 
+import dataclasses
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
@@ -69,6 +70,14 @@ def response_json(
         {"value": value, "evidence": evidence} for value, evidence in references or []
     ]
     return json.dumps({"fields": payload}, ensure_ascii=False)
+
+
+PRICED_MODEL = "claude-sonnet-5-5"
+
+
+def priced(answer: LLMResult, usage: LLMUsage) -> LLMResult:
+    """Тот же ответ от модели с известной ценой и заданным usage (учёт стоимости)."""
+    return dataclasses.replace(answer, model=PRICED_MODEL, usage=usage)
 
 
 def result(text: str | None = None, stop_reason: StopReason = StopReason.END_TURN) -> LLMResult:

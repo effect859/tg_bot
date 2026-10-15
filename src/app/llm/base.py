@@ -21,6 +21,13 @@ class LLMUsage:
     cached_tokens: int = 0
     # Записано в кэш промпта (у провайдера — отдельно от input_tokens).
     cache_creation_tokens: int = 0
+    # Для расчёта стоимости (app.llm.pricing); None — провайдер не сообщил. Запись в
+    # кэш по сроку хранения: у 5 минут и 1 часа разный тариф.
+    cache_write_5m_tokens: int | None = None
+    cache_write_1h_tokens: int | None = None
+    # Тариф и регион обработки запроса, как их сообщил провайдер.
+    service_tier: str | None = None
+    inference_geo: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

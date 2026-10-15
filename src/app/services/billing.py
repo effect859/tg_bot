@@ -12,6 +12,10 @@
 3. Возврат за сбой генерации после оплаты. refund_failed_order в одной транзакции
    возвращает фактическое списание (ORDER_REFUND + users.balance) и переводит заказ
    FAILED → CANCELLED. Блокировки: пользователь → заказ.
+4. Ручная корректировка оператором (консольная команда app.admin_credits, в Telegram
+   не доступна). admin_adjust в одной транзакции пишет ADMIN_ADJUST в журнал и меняет
+   users.balance; выполняется только с кодом подтверждения из предпросмотра, который
+   устаревает после любой проводки пользователя. Блокировки: только пользователь.
 
 Единый порядок блокировок: платёж → пользователь → заказ. Пользователь раньше заказа —
 как у любого апдейта бота: UserMiddleware в начале транзакции обновляет строку
@@ -33,10 +37,11 @@ lock_order и статус (а в крайнем случае — в уника�
 В логах — только идентификаторы и коды, без Telegram id и содержимого заказа.
 """
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 from sqlalchemy import func, select
@@ -367,6 +372,187 @@ async def refund_failed_order(session: AsyncSession, order_id: int) -> RefundOut
     await session.commit()
     logger.info("Failed order refunded: order_id=%s amount=%s", order_id, amount)
     return outcome
+
+
+# --- Ручная корректировка оператором ----------------------------------------------------
+
+# Предел одной корректировки (по модулю): опечатка в числе не станет огромной суммой.
+MAX_ADMIN_ADJUST_CREDITS = 10_000
+# За какой срок предпросмотр показывает уже сделанные корректировки (для сведения).
+RECENT_ADJUSTMENTS_WINDOW = timedelta(hours=24)
+
+
+class AdjustmentRefusal(StrEnum):
+    USER_NOT_FOUND = "user_not_found"
+    # Не целое, ноль или больше MAX_ADMIN_ADJUST_CREDITS по модулю.
+    INVALID_AMOUNT = "invalid_amount"
+    NEGATIVE_BALANCE = "negative_balance"
+    # Код подтверждения не совпал: баланс или журнал изменились после предпросмотра,
+    # корректировка уже выполнена этим кодом или код от другой операции.
+    STALE_CODE = "stale_code"
+
+
+@dataclass(frozen=True)
+class AdjustmentPreview:
+    """Что сделает корректировка; ничего не меняет."""
+
+    user_id: int
+    credits: int
+    balance: int
+    new_balance: int
+    # Код для выполнения именно этой операции в текущем состоянии счёта.
+    confirm_code: str
+    # Корректировки за RECENT_ADJUSTMENTS_WINDOW — только для сведения оператора.
+    recent_adjustments: int
+    refusal: AdjustmentRefusal | None = None
+
+
+@dataclass(frozen=True)
+class AdjustmentOutcome:
+    refusal: AdjustmentRefusal | None
+    user_id: int | None = None
+    balance: int | None = None
+    transaction_id: int | None = None
+
+
+@dataclass(frozen=True)
+class LedgerEntry:
+    id: int
+    amount: int
+    reason: TransactionReason
+    order_id: int | None
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class AdminAccount:
+    """Состояние счёта для оператора (только чтение)."""
+
+    user_id: int
+    balance: int
+    ledger_balance: int
+    last_entries: list[LedgerEntry]
+    active_order_id: int | None
+    active_order_status: OrderStatus | None
+    active_order_price: int | None
+
+
+async def admin_account(
+    session: AsyncSession, tg_id: int, *, entries: int = 5
+) -> AdminAccount | None:
+    """Баланс, последние проводки и активный заказ пользователя; None — нет пользователя."""
+    user = await session.scalar(select(User).where(User.tg_id == tg_id))
+    if user is None:
+        return None
+    rows = await session.scalars(
+        select(BalanceTransaction)
+        .where(BalanceTransaction.user_id == user.id)
+        .order_by(BalanceTransaction.id.desc())
+        .limit(entries)
+    )
+    order = await get_active_order(session, user.id)
+    return AdminAccount(
+        user_id=user.id,
+        balance=user.balance,
+        ledger_balance=await ledger_balance(session, user.id),
+        last_entries=[
+            LedgerEntry(row.id, row.amount, row.reason, row.order_id, row.created_at)
+            for row in rows
+        ],
+        active_order_id=order.id if order is not None else None,
+        active_order_status=order.status if order is not None else None,
+        active_order_price=order.price if order is not None else None,
+    )
+
+
+async def preview_admin_adjustment(
+    session: AsyncSession, tg_id: int, credits: int
+) -> AdjustmentPreview | AdjustmentRefusal:
+    """Предпросмотр корректировки: без блокировок и записи. Отказ — USER_NOT_FOUND."""
+    user = await session.scalar(select(User).where(User.tg_id == tg_id))
+    if user is None:
+        return AdjustmentRefusal.USER_NOT_FOUND
+    since = datetime.now(UTC) - RECENT_ADJUSTMENTS_WINDOW
+    recent = await session.scalar(
+        select(func.count()).where(
+            BalanceTransaction.user_id == user.id,
+            BalanceTransaction.reason == TransactionReason.ADMIN_ADJUST,
+            BalanceTransaction.created_at >= since,
+        )
+    )
+    refusal = _adjustment_refusal(user.balance, credits)
+    valid = refusal is not AdjustmentRefusal.INVALID_AMOUNT
+    return AdjustmentPreview(
+        user_id=user.id,
+        credits=credits,
+        balance=user.balance,
+        new_balance=user.balance + credits if valid else user.balance,
+        confirm_code=await _confirm_code(session, user, credits),
+        recent_adjustments=int(recent or 0),
+        refusal=refusal,
+    )
+
+
+async def admin_adjust(
+    session: AsyncSession, tg_id: int, credits: int, confirm_code: str
+) -> AdjustmentOutcome:
+    """Корректировка баланса: ADMIN_ADJUST + users.balance одним commit.
+
+    Выполняется, только если confirm_code совпадает с кодом текущего состояния счёта
+    (пересчитывается под блокировкой пользователя). Код меняется после любой проводки
+    пользователя, поэтому повтор той же команды после успеха отклоняется (STALE_CODE).
+    Это защита от случайного повтора, а не идемпотентность: новый предпросмотр даст
+    новый код. При любом отказе ничего не меняется (rollback).
+    """
+    user_id = await session.scalar(select(User.id).where(User.tg_id == tg_id))
+    if user_id is None:
+        await session.rollback()
+        return AdjustmentOutcome(AdjustmentRefusal.USER_NOT_FOUND)
+    user = await _lock_user(session, user_id)
+    refusal = _adjustment_refusal(user.balance, credits)
+    if refusal is None and confirm_code != await _confirm_code(session, user, credits):
+        refusal = AdjustmentRefusal.STALE_CODE
+    if refusal is not None:
+        balance = user.balance
+        await session.rollback()
+        return AdjustmentOutcome(refusal, user_id, balance)
+
+    transaction = BalanceTransaction(
+        user_id=user_id, amount=credits, reason=TransactionReason.ADMIN_ADJUST
+    )
+    session.add(transaction)
+    user.balance += credits
+    await session.flush()
+    outcome = AdjustmentOutcome(None, user_id, user.balance, transaction.id)
+    await session.commit()
+    logger.info(
+        "Admin balance adjustment: user_id=%s amount=%s transaction_id=%s",
+        user_id,
+        credits,
+        outcome.transaction_id,
+    )
+    return outcome
+
+
+def _adjustment_refusal(balance: int, credits: int) -> AdjustmentRefusal | None:
+    # bool — подкласс int, но суммой не бывает.
+    if type(credits) is not int or credits == 0 or abs(credits) > MAX_ADMIN_ADJUST_CREDITS:
+        return AdjustmentRefusal.INVALID_AMOUNT
+    if balance + credits < 0:
+        return AdjustmentRefusal.NEGATIVE_BALANCE
+    return None
+
+
+async def _confirm_code(session: AsyncSession, user: User, credits: int) -> str:
+    """Код операции в текущем состоянии счёта: пользователь, сумма, баланс, последняя проводка.
+
+    Не секрет и не подпись: только привязка подтверждения к увиденному состоянию.
+    """
+    last_id = await session.scalar(
+        select(func.max(BalanceTransaction.id)).where(BalanceTransaction.user_id == user.id)
+    )
+    state = f"{user.id}:{credits}:{user.balance}:{last_id or 0}"
+    return hashlib.sha256(state.encode()).hexdigest()[:12]
 
 
 # --- Чтение ---------------------------------------------------------------------------

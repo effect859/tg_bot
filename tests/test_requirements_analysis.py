@@ -7,6 +7,7 @@
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import anthropic
 import httpx2
@@ -19,7 +20,7 @@ from app.domain.enums import LLMCallStatus, OrderStatus, VersionStatus
 from app.domain.errors import AnalysisLimitReachedError, InvalidStatusTransitionError
 from app.domain.requirements import MAX_ANALYSIS_LLM_CALLS
 from app.llm.anthropic import AnthropicLLMClient
-from app.llm.base import LLMPermanentError, LLMTemporaryError, StopReason
+from app.llm.base import LLMPermanentError, LLMTemporaryError, LLMUsage, StopReason
 from app.services import order_materials as materials
 from app.services import orders
 from app.services import requirements_analysis as analysis
@@ -34,7 +35,7 @@ from app.services.requirements_analysis import (
     run_analysis_pass,
 )
 from app.services.users import register_or_update_user
-from fake_llm import FakeLLMClient, response_json, result
+from fake_llm import PRICED_MODEL, FakeLLMClient, priced, response_json, result
 
 S = OrderStatus
 K = AnalysisOutcomeKind
@@ -717,3 +718,49 @@ def test_recovery_constants() -> None:
     assert timedelta(minutes=10) == analysis.STEP_STALE_AFTER
     assert timedelta(minutes=1) == analysis.NEW_ORDER_GRACE
     assert analysis.MAX_TOKENS == 16_000
+
+
+# --- Стоимость вызова (Stage 3.12) ----------------------------------------------------
+
+PRICED_USAGE = LLMUsage(
+    input_tokens=1000,
+    output_tokens=500,
+    cached_tokens=2000,
+    cache_creation_tokens=3000,
+    cache_write_5m_tokens=1000,
+    cache_write_1h_tokens=2000,
+)
+# 1000·2 + 500·10 + 2000·0,10 + 1000·2,50 + 2000·4 = 17 700 (USD·10⁻⁶).
+PRICED_COST = Decimal("0.017700")
+
+
+async def test_call_cost_and_cache_write_recorded(session: AsyncSession) -> None:
+    order_id = await _order(session)
+
+    await analyze_requirements(session, FakeLLMClient(priced(GOOD, PRICED_USAGE)), order_id)
+
+    [call] = await _calls(session, order_id)
+    assert call.model == PRICED_MODEL
+    assert (call.cached_tokens, call.cache_creation_tokens) == (2000, 3000)
+    assert call.cost_usd == PRICED_COST
+
+
+async def test_unknown_model_cost_is_null(session: AsyncSession) -> None:
+    order_id = await _order(session)
+
+    await analyze_requirements(session, FakeLLMClient(GOOD), order_id)
+
+    [call] = await _calls(session, order_id)
+    assert call.model == "fake-model-2026"
+    assert call.cost_usd is None  # NULL, а не 0
+
+
+async def test_call_without_response_has_no_cost(session: AsyncSession) -> None:
+    """Ответа нет — usage неизвестен: стоимость NULL, хотя провайдер мог вызов оплатить."""
+    order_id = await _order(session)
+
+    await analyze_requirements(session, FakeLLMClient(LLMTemporaryError("http_529")), order_id)
+
+    [call] = await _calls(session, order_id)
+    assert (call.status, call.error) == (LLMCallStatus.ERROR, "http_529")
+    assert (call.input_tokens, call.output_tokens, call.cost_usd) == (0, 0, None)
